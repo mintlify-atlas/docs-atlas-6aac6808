@@ -1,0 +1,200 @@
+---
+title: "Publish and subscribe with topic streams"
+description: "Use p2panda topic streams to publish and receive messages, handle StreamEvent variants, configure acknowledgements, and replay from a custom cursor."
+---
+
+Topics are the fundamental unit of data organisation in p2panda. A topic is simply a random byte sequence that identifies a shared data space. Any node that knows the same topic bytes will automatically discover and sync with other nodes interested in that topic — no centralised registry required. This guide walks through creating topic streams, handling the events they emit, using ephemeral streams for transient messages, and controlling replay behaviour with cursors.
+
+## What is a Topic?
+
+A `Topic` is an arbitrary byte sequence that groups related data. It could represent a chat room, a collaborative document, a game session, or any other application concept. Nodes advertise interest in a topic to the network and the p2panda sync protocol ensures they exchange all operations published under that topic.
+
+```rust
+use p2panda::Topic;
+
+// Generate a random 32-byte topic identifier.
+let chat_id = Topic::random();
+```
+
+## Creating a stream
+
+Call `node.stream::<M>(topic)` to create a publish/subscribe stream over a topic. The type parameter `M` is your application message type — any type that implements `serde::Serialize` and `serde::Deserialize`. The call returns a `(StreamPublisher<M>, StreamSubscription<M>)` pair.
+
+```rust
+use futures_util::StreamExt;
+use p2panda::Topic;
+use p2panda::streams::StreamEvent;
+
+let node = p2panda::spawn().await?;
+let chat_id = Topic::random();
+
+let (tx, mut rx) = node.stream::<String>(chat_id).await?;
+tx.publish("Hello, Panda!".to_string()).await?;
+
+while let Some(event) = rx.next().await {
+    if let StreamEvent::Processed { operation, .. } = event {
+        println!(
+            "[{}]: {} from {}",
+            operation.timestamp(),
+            operation.message(),
+            operation.author(),
+        );
+    }
+}
+```
+
+The subscription is stateful: it persists an acknowledgement cursor in the local SQLite database so that unprocessed events are automatically replayed on the next startup.
+
+## StreamEvent variants
+
+Every item emitted from a `StreamSubscription` is a `StreamEvent<M>`. The variants cover both application messages and system-level notifications:
+
+<AccordionGroup>
+
+<Accordion title="StreamEvent::Processed">
+An operation with an application message has been fully processed through the system pipeline and is ready for your application logic. The `operation` field is a `ProcessedOperation<M>` exposing `.message()`, `.author()`, `.timestamp()`, `.id()`, and `.topic()`.
+
+```rust
+if let StreamEvent::Processed { operation, source } = event {
+    println!("message: {:?}", operation.message());
+    println!("author:  {}", operation.author());
+}
+```
+</Accordion>
+
+<Accordion title="StreamEvent::SyncStarted">
+A sync session with a remote peer has begun for this topic. Useful for showing progress indicators.
+
+```rust
+if let StreamEvent::SyncStarted {
+    remote_node_id,
+    incoming_bytes,
+    incoming_operations,
+    ..
+} = event {
+    println!("syncing {} bytes from {}", incoming_bytes, remote_node_id);
+}
+```
+</Accordion>
+
+<Accordion title="StreamEvent::SyncEnded">
+The sync session with a remote peer has finished. Includes bytes and operation counts for the session as well as cumulative topic totals. If the session failed, `error` contains the reason.
+
+```rust
+if let StreamEvent::SyncEnded { remote_node_id, error, .. } = event {
+    if let Some(err) = error {
+        eprintln!("sync with {} ended with error: {:?}", remote_node_id, err);
+    }
+}
+```
+</Accordion>
+
+<Accordion title="StreamEvent::ReplayStarted / ReplayEnded">
+Emitted around the replay phase at subscription startup. `ReplayStarted` includes the number of operations that will be replayed. `ReplayEnded` signals that replay is complete and live streaming has begun.
+</Accordion>
+
+<Accordion title="StreamEvent::ProcessingFailed">
+An operation failed during system-level processing. This is typically caused by invalid operations from a broken or malicious peer, or by a bug in p2panda itself. The `error` field contains the `ProcessorError`.
+</Accordion>
+
+<Accordion title="StreamEvent::DecodeFailed">
+Deserialization of the operation payload into type `M` failed. This is an application-level error indicating a malformed payload. The operation remains stored locally and can be replayed after a fix is deployed.
+</Accordion>
+
+<Accordion title="StreamEvent::ImportStarted / ImportEnded">
+Emitted when operations are imported from an external source via `tx.import(stream)`, for example from a USB stick or another sync transport.
+</Accordion>
+
+<Accordion title="StreamEvent::AckFailed">
+The store encountered an error while trying to acknowledge an event. This normally indicates a low-level storage problem such as running out of disk space.
+</Accordion>
+
+</AccordionGroup>
+
+## Ephemeral streams
+
+Use `node.ephemeral_stream::<M>(topic)` for messages that do not need to be persisted or replayed. Ephemeral messages are signed for integrity but are never stored locally and are only delivered to peers that are online at the moment of publishing.
+
+```rust
+let (tx, mut rx) = node.ephemeral_stream::<String>(chat_id).await?;
+tx.publish("typing...".to_string()).await?;
+```
+
+Ephemeral streams are well suited for presence indicators, typing notifications, live cursors, and other transient signals.
+
+## System events
+
+Network-level events that are not scoped to a specific topic — such as peer discovery events — can be observed through the system event stream. Call `node.event_stream()` immediately after spawning the node to capture all events from startup.
+
+```rust
+use futures_util::StreamExt;
+use p2panda::streams::SystemEvent;
+
+let mut events = node.event_stream().await?;
+
+while let Some(event) = events.next().await {
+    if let SystemEvent::Discovery(discovery_event) = event {
+        println!("discovery: {:?}", discovery_event);
+    }
+}
+```
+
+<Note>
+Events generated before `event_stream()` is called are not emitted. Call this method right after `spawn()` if you want to observe the full lifecycle of the node.
+</Note>
+
+## Acknowledgement policies
+
+Topic stream subscriptions are stateful consumers, similar to those in NATS JetStream or Kafka. Each subscription persists a cursor in the local database. When the stream is recreated — for example after an application restart — unacknowledged operations are automatically replayed before live events are delivered.
+
+Two policies are available:
+
+| Policy | Behaviour |
+|---|---|
+| `AckPolicy::Automatic` (default) | Events are acknowledged immediately on delivery. |
+| `AckPolicy::Explicit` | Your code must call `operation.ack().await?` after successful processing. |
+
+Set the policy on the builder:
+
+```rust
+use p2panda::node::AckPolicy;
+
+let node = p2panda::builder()
+    .ack_policy(AckPolicy::Explicit)
+    .spawn()
+    .await?;
+```
+
+With explicit acknowledgement, call `ack()` on the `ProcessedOperation` after your application has finished handling the message:
+
+```rust
+while let Some(StreamEvent::Processed { operation, .. }) = rx.next().await {
+    // Apply message to application state.
+    let crdt = operation.message();
+
+    // Mark as processed — won't be replayed on next startup.
+    operation.ack().await?;
+}
+```
+
+System-level operations (pruning, key-agreement control messages, etc.) are always acknowledged automatically, regardless of the configured policy.
+
+## Replay and cursor control
+
+By default `node.stream(topic)` resumes from the frontier: it replays only events that have not yet been acknowledged. Use `node.stream_from(topic, from)` to control the starting position explicitly.
+
+```rust
+use p2panda::streams::StreamFrom;
+
+// Replay all known events from the beginning, including already acknowledged ones.
+let (tx, rx) = node.stream_from(topic, StreamFrom::Start).await?;
+
+// Resume from a specific cursor position.
+let (tx, rx) = node.stream_from(topic, StreamFrom::Cursor(cursor)).await?;
+```
+
+`StreamFrom::Start` is useful after a breaking schema change when all state must be re-materialised. `StreamFrom::Cursor` allows fine-grained replay from a known position in the log.
+
+<Warning>
+The ack state for a topic is shared across all `StreamSubscription` instances created with the same topic. Creating more than one subscription over the same topic using `node.stream()` leads to "work stealing" behaviour where each subscription acknowledges events independently, causing duplicate deliveries and potentially surprising processing results. Use a single subscription per topic in your application.
+</Warning>

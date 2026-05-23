@@ -1,0 +1,199 @@
+---
+title: "p2panda-blobs — content-addressed blob sync"
+description: "Storage, retrieval, and p2p synchronisation of content-addressed blobs built on iroh-blobs, with configurable concurrency limits and retry policies."
+---
+
+`p2panda-blobs` provides content-addressed storage for arbitrary binary data in p2panda applications. Blobs are identified by their BLAKE3 hash and can be imported from the filesystem or byte streams, downloaded from remote peers, exported back to disk, and verified at any point. The crate is built on top of `iroh-blobs` and integrates with `p2panda-net`'s `Network` for peer-to-peer blob transfer with configurable concurrency limits and retry policies.
+
+## Installation
+
+```toml Cargo.toml
+[dependencies]
+p2panda-blobs = "0.6.1"
+```
+
+## Key exports
+
+<AccordionGroup>
+  <Accordion title="Main type">
+    | Type | Description |
+    |------|-------------|
+    | `Blobs<T, S>` | The blob service. Generic over topic query type `T` and store `S`. |
+    | `Config` | Concurrency limits and retry configuration for the blob downloader. |
+  </Accordion>
+
+  <Accordion title="Import / export events">
+    | Type | Description |
+    |------|-------------|
+    | `ImportBlobEvent` | Stream event emitted during import: `Done(Hash)` or `Abort(error)`. |
+    | `DownloadBlobEvent` | Stream event emitted during peer download. |
+  </Accordion>
+</AccordionGroup>
+
+## Creating a Blobs service
+
+`Blobs` is constructed from a `NetworkBuilder` (provided by `p2panda-net`) and an `iroh-blobs`-compatible store. The blob protocol is registered on the network automatically.
+
+```rust
+use p2panda_blobs::Blobs;
+use iroh_blobs::store::mem::Store as MemStore;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let store = MemStore::new();
+
+    let (network, blobs) = Blobs::from_builder(
+        network_builder, // NetworkBuilder<T> from p2panda-net
+        store,
+    )
+    .await?;
+
+    Ok(())
+}
+```
+
+For custom configuration, use `from_builder_with_config`:
+
+```rust
+use p2panda_blobs::{Blobs, Config};
+use std::time::Duration;
+
+let config = Config {
+    max_concurrent_requests: 16,
+    max_concurrent_requests_per_node: 4,
+    max_open_connections: 32,
+    max_concurrent_dials_per_hash: 4,
+    max_retries_per_node: 3,
+    initial_retry_delay: Duration::from_millis(500),
+};
+
+let (network, blobs) = Blobs::from_builder_with_config(
+    network_builder,
+    store,
+    config,
+)
+.await?;
+```
+
+## Blob API
+
+### Import from filesystem
+
+```rust
+use std::path::PathBuf;
+use futures_util::StreamExt;
+use p2panda_blobs::ImportBlobEvent;
+
+let path = PathBuf::from("my-file.png");
+let mut events = blobs.import_blob(path).await;
+
+while let Some(event) = events.next().await {
+    match event {
+        ImportBlobEvent::Done(hash) => {
+            println!("Imported blob: {}", hash);
+        }
+        ImportBlobEvent::Abort(err) => {
+            eprintln!("Import failed: {}", err);
+        }
+    }
+}
+```
+
+### Import from a byte stream
+
+```rust
+use bytes::Bytes;
+use futures_util::StreamExt;
+
+// Any Stream<Item = io::Result<Bytes>> works.
+let data_stream = futures_util::stream::iter(
+    vec![Ok(Bytes::from(b"hello world".to_vec()))]
+);
+
+let mut events = blobs.import_blob_from_stream(data_stream).await;
+
+while let Some(event) = events.next().await {
+    // Handle ImportBlobEvent::Done or Abort.
+}
+```
+
+### Download from a peer
+
+```rust
+use p2panda_core::Hash;
+use futures_util::StreamExt;
+
+let hash: Hash = "...".parse()?;
+let mut events = blobs.download_blob(hash).await;
+
+while let Some(event) = events.next().await {
+    // Handle DownloadBlobEvent variants.
+}
+```
+
+### Get a local blob entry
+
+```rust
+let hash: Hash = "...".parse()?;
+
+if let Some(entry) = blobs.get(hash).await? {
+    // entry provides metadata and access to the blob data.
+    println!("Blob size: {}", entry.size());
+}
+```
+
+### Export to filesystem
+
+```rust
+use std::path::PathBuf;
+
+let hash: Hash = "...".parse()?;
+let dest = PathBuf::from("output.png");
+
+blobs.export_blob(hash, &dest).await?;
+```
+
+## Configuration
+
+<AccordionGroup>
+  <Accordion title="Config fields">
+    | Field | Default | Description |
+    |-------|---------|-------------|
+    | `max_concurrent_requests` | from iroh-blobs | Total requests performed concurrently. |
+    | `max_concurrent_requests_per_node` | from iroh-blobs | Concurrent requests to a single peer. |
+    | `max_open_connections` | from iroh-blobs | Maximum simultaneous open connections. |
+    | `max_concurrent_dials_per_hash` | from iroh-blobs | Parallel dial attempts per blob hash. |
+    | `max_retries_per_node` | from iroh-blobs | Retry attempts for failed or erroring peers. |
+    | `initial_retry_delay` | from iroh-blobs | Base delay before first retry; multiplied by retry count. |
+  </Accordion>
+</AccordionGroup>
+
+## Storage backends
+
+`Blobs<T, S>` is generic over the store `S`, which must implement `iroh_blobs::store::Store`. Two ready-made backends are available from `iroh-blobs`:
+
+| Backend | Description |
+|---------|-------------|
+| `iroh_blobs::store::mem::Store` | In-memory store. Data is lost when the process exits. |
+| `iroh_blobs::store::fs::Store` | Filesystem store. Data is persisted to a directory on disk. |
+
+```rust
+// In-memory (testing / ephemeral use):
+let store = iroh_blobs::store::mem::Store::new();
+
+// Filesystem (production use):
+let store = iroh_blobs::store::fs::Store::load("./blob-data").await?;
+```
+
+<Note>
+`p2panda-blobs` is currently undergoing refactoring following the `p2panda-net` redesign. The API surface may change in upcoming releases.
+</Note>
+
+<CardGroup cols={2}>
+  <Card title="p2panda-net" href="/crates/p2panda-net">
+    Provides the `NetworkBuilder` used to construct and integrate the blob protocol.
+  </Card>
+  <Card title="p2panda-core" href="/crates/p2panda-core">
+    The `Hash` type used to identify blobs by their BLAKE3 content hash.
+  </Card>
+</CardGroup>

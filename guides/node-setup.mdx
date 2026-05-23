@@ -1,0 +1,193 @@
+---
+title: "Configure and spawn a p2panda node"
+description: "Learn how to configure a p2panda NodeBuilder with a signing key, SQLite database, relay server, bootstrap peers, mDNS mode, and network identity."
+---
+
+Every p2panda application starts with a `Node`. The `Node` manages networking, peer discovery, local storage, operation processing, and the event streams your application reads from and writes to. The simplest way to get started is `p2panda::spawn()`, which creates an in-memory node that discovers peers automatically on the local area network. For production use you will want to persist data to disk and configure relay servers so that nodes can find each other over the Internet.
+
+## Spawn a default node
+
+The default node uses an ephemeral in-memory SQLite database, generates a fresh signing key on every run, and enables active mDNS discovery on the LAN. No relay or bootstrap configuration is needed for purely local-network applications.
+
+```rust
+let node = p2panda::spawn().await?;
+```
+
+Alternatively you can obtain the same result through the builder:
+
+```rust
+let node = p2panda::builder().spawn().await?;
+```
+
+## Production setup
+
+<Steps>
+
+### Generate or load a signing key
+
+The signing key identifies the node in the network and authenticates every operation it creates. If you omit this step a random key is generated on each startup, giving the node a different identity every time.
+
+```rust
+use p2panda::SigningKey;
+
+// Generate a fresh key and persist the bytes for future use.
+let signing_key = SigningKey::generate();
+```
+
+Pass the key to the builder:
+
+```rust
+let node = p2panda::builder()
+    .signing_key(signing_key)
+    .spawn()
+    .await?;
+```
+
+### Set a persistent database URL
+
+By default all data lives in an ephemeral in-memory database that is lost when the process exits. Pass a SQLite URI to persist operations, sync state, address books, and stream cursors across restarts.
+
+```rust
+let node = p2panda::builder()
+    .database_url("db.sqlite")
+    .spawn()
+    .await?;
+```
+
+The URL must follow the [SQLite URI format](https://sqlite.org/uri.html). Migrations are applied automatically. If you need manual migration management, supply a pre-built connection pool via `database_pool(pool)` together with `sqlx`.
+
+### Add a relay server URL
+
+Relay servers enable nodes to reach each other over the Internet when a direct peer-to-peer connection is not yet established. The relay temporarily routes encrypted traffic, assists with QUIC address discovery (STUN), and provides an encrypted fallback when hole-punching fails (TURN).
+
+```rust
+use p2panda::RelayUrl;
+
+let relay_url: RelayUrl = "https://my.relay.link".parse()?;
+
+let node = p2panda::builder()
+    .relay_url(relay_url)
+    .spawn()
+    .await?;
+```
+
+Multiple relay URLs can be added; the node automatically selects a "home relay" based on latency.
+
+### Add bootstrap peers
+
+Bootstrap nodes seed the random-walk peer discovery algorithm. Any reachable node in your network can act as a bootstrap. The relay URL of the bootstrap peer is required so the node can reach it even before a direct connection is established.
+
+```rust
+let bootstrap_id = "1021253b4ccdfba6cac196d2b9fa6ebb605b747bcd502d6bf1d46887f04ec913".parse()?;
+let relay_url: RelayUrl = "https://my.relay.link".parse()?;
+
+let node = p2panda::builder()
+    .bootstrap(bootstrap_id, relay_url)
+    .spawn()
+    .await?;
+```
+
+Register several bootstrap nodes for redundancy in case any go offline.
+
+</Steps>
+
+## Full configured node example
+
+The following example combines all of the above steps into a single builder chain:
+
+```rust
+use p2panda::RelayUrl;
+
+let bootstrap_id = "1021253b4ccdfba6cac196d2b9fa6ebb605b747bcd502d6bf1d46887f04ec913".parse()?;
+let relay_url: RelayUrl = "https://my.relay.link".parse()?;
+let database_url = "db.sqlite";
+
+let node = p2panda::builder()
+    .database_url(database_url)
+    .bootstrap(bootstrap_id, relay_url.clone())
+    .relay_url(relay_url)
+    .spawn()
+    .await?;
+```
+
+Bootstrap nodes can also be added at runtime after the node has started:
+
+```rust
+node.insert_bootstrap(bootstrap_id, relay_url).await?;
+```
+
+## NodeBuilder API reference
+
+<AccordionGroup>
+
+<Accordion title="signing_key(key)">
+Sets the Ed25519 signing key used to identify this node and sign all operations it creates. The corresponding public key (`NodeId`) is derived automatically. If omitted, a random key is generated on each startup.
+
+```rust
+.signing_key(signing_key)
+```
+</Accordion>
+
+<Accordion title="database_url(url)">
+Accepts a SQLite URI string. If omitted, an ephemeral in-memory database is used. Migrations are run automatically.
+
+```rust
+.database_url("db.sqlite")
+```
+</Accordion>
+
+<Accordion title="database_pool(pool)">
+Accepts a pre-built `SqlitePool` from `sqlx`. Use this variant when you need manual migration control or a custom connection pool configuration.
+
+```rust
+.database_pool(pool)
+```
+</Accordion>
+
+<Accordion title="relay_url(url)">
+Adds a relay server URL. Multiple calls add multiple relays; the node selects a home relay based on latency. Without a relay, nodes can only connect if a directly-reachable IP address is already known to both sides.
+
+```rust
+.relay_url(relay_url)
+```
+</Accordion>
+
+<Accordion title="bootstrap(node_id, relay_url)">
+Inserts a node into the local address book as a bootstrap peer. The relay URL of the bootstrap node is required for initial reachability. Multiple calls register multiple bootstrap nodes.
+
+```rust
+.bootstrap(node_id, relay_url)
+```
+</Accordion>
+
+<Accordion title="network_id(id)">
+Sets the network identifier — a 32-byte value used to logically separate distinct p2panda networks. Nodes with different network identifiers will not interoperate. Defaults to the BLAKE3 hash of the string `"p2panda"`.
+
+```rust
+.network_id(network_id)
+```
+</Accordion>
+
+<Accordion title="ack_policy(policy)">
+Sets the acknowledgement policy for topic stream consumers. Defaults to `AckPolicy::Automatic`. Set to `AckPolicy::Explicit` when you need at-least-once processing guarantees with manual acknowledgement.
+
+```rust
+use p2panda::node::AckPolicy;
+.ack_policy(AckPolicy::Explicit)
+```
+</Accordion>
+
+<Accordion title="mdns_mode(mode)">
+Controls mDNS peer discovery on the local area network. Accepted values are `MdnsDiscoveryMode::Active` (default — the node advertises itself), `Passive`, or `Disabled`.
+
+```rust
+use p2panda::network::MdnsDiscoveryMode;
+.mdns_mode(MdnsDiscoveryMode::Disabled)
+```
+</Accordion>
+
+</AccordionGroup>
+
+<Note>
+The `network_id` value is **not** exchanged confidentially with remote peers during connection setup and must not be treated as a secret. It is a logical namespace identifier, not a security credential. See [issue #965](https://github.com/p2panda/p2panda/issues/965) for context.
+</Note>

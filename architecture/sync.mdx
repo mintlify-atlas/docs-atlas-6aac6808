@@ -1,0 +1,120 @@
+---
+title: "Local-first sync protocol in p2panda"
+description: "p2panda sync exchanges compact state vectors to replicate only missing operations, guaranteeing eventual consistency across all connected peers."
+---
+
+p2panda's sync layer is responsible for bringing two nodes to a shared view of a topic's operation history without requiring a central server or a persistent connection. Sync sessions are short-lived, bilateral conversations: peers exchange compact summaries of what they already have, then transfer only the operations the other side is missing. Because every author's log is append-only and addressed by a monotonically increasing sequence number, these summaries stay small regardless of total dataset size.
+
+## Fundamentals
+
+<CardGroup cols={2}>
+  <Card title="State vectors" icon="table">
+    A state vector maps each known author public key to the highest sequence number stored locally. Sharing state vectors lets two peers compute the exact set of missing operations in a single round-trip.
+  </Card>
+  <Card title="Append-only efficiency" icon="arrow-trend-up">
+    Because `seq_num` only ever increases and `backlink` chains operations together cryptographically, a peer can request "everything after seq_num N for author A" without ambiguity or re-downloading already-held data.
+  </Card>
+  <Card title="Partial replication" icon="filter">
+    Sync is scoped to a single topic. A node only exchanges operations relevant to topics it has subscribed to, so storage and bandwidth scale with actual interest rather than total network activity.
+  </Card>
+  <Card title="Eventual consistency" icon="check-double">
+    Given sufficient connectivity, all nodes that share a topic will converge to the same set of operations. No coordinator is required; convergence is a structural property of the append-only log model.
+  </Card>
+</CardGroup>
+
+<Note>
+State vectors work naturally in broadcast-oriented networks such as packet radio. A node can announce its state vector in a single packet and any node receiving it can determine what to retransmit.
+</Note>
+
+## The `SyncProtocol` trait
+
+Custom sync protocols are implemented by satisfying two traits defined in `p2panda-sync`: `Protocol` for the actual session logic, and `Manager` for lifecycle management of sessions.
+
+```rust
+// From p2panda-sync/src/traits.rs
+
+/// Generic protocol interface which runs over a sink and stream pair.
+pub trait Protocol {
+    type Output;
+    type Error: StdError + Send + Sync + 'static;
+    type Message: Serialize + for<'a> Deserialize<'a>;
+
+    fn run(
+        self,
+        sink: &mut (impl Sink<Self::Message, Error = impl Debug> + Unpin),
+        stream: &mut (impl Stream<Item = Result<Self::Message, impl Debug>> + Unpin),
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>;
+}
+
+/// Interface for managing sync sessions and consuming events they emit.
+pub trait Manager<T> {
+    type Protocol: Protocol + Send + 'static;
+    type Args: Clone + Send + 'static;
+    type Message: Clone + Send + 'static;
+    type Event: Clone + Debug + Send + 'static;
+    type Error: StdError + Send + Sync + 'static;
+
+    fn from_args(args: Self::Args) -> Self;
+
+    /// Instantiate a new sync session.
+    fn session(
+        &mut self,
+        session_id: u64,
+        config: &SessionConfig<T>,
+    ) -> impl Future<Output = Self::Protocol>;
+
+    /// Retrieve a send handle to an already existing sync session.
+    fn session_handle(
+        &self,
+        session_id: u64,
+    ) -> impl Future<Output = Option<Pin<Box<dyn Sink<ToSync<Self::Message>, Error = Self::Error>>>>>;
+
+    /// Subscribe to the manager event stream.
+    fn subscribe(&mut self) -> impl Stream<Item = FromSync<Self::Event>> + Send + Unpin + 'static;
+}
+```
+
+`Protocol::run` receives a `Sink` and a `Stream` representing the full-duplex channel to the remote peer. The implementation is responsible for the message exchange that determines what to send and what to request. `Manager` handles instantiation, routing messages to the correct session, and surfacing sync events to the rest of the stack via `subscribe`.
+
+<Tip>
+The trait bounds on `Protocol::Message` require only `Serialize + Deserialize`. Any CBOR-compatible type works, which means you can carry protocol metadata, bloom filters, or range proofs alongside raw operation bytes in a single message type.
+</Tip>
+
+## Eventual consistency
+
+All peers that can reach each other will converge to identical operation sets for a given topic. There are no conflict resolution rules needed at the sync layer because each log is single-writer: two operations from different authors with the same `seq_num` are simply operations in different logs, not a conflict.
+
+<Steps>
+  <Step title="Peers connect">
+    Two nodes discover each other through mDNS or random-walk discovery and open a QUIC connection via iroh.
+  </Step>
+  <Step title="State vectors exchanged">
+    Each side sends its state vector for the shared topic: a map of `{author_public_key → max_seq_num}`.
+  </Step>
+  <Step title="Missing operations transferred">
+    Each side computes the difference and streams the missing operations to the other. Operations are validated before being written to local storage.
+  </Step>
+  <Step title="Convergence">
+    After the session completes, both nodes hold the same set of operations for the topic and are in a consistent state.
+  </Step>
+</Steps>
+
+## Deduplication
+
+The sync layer deduplicates by operation hash. An operation is identified by the BLAKE3 hash of its CBOR-encoded header. Before persisting a received operation, the node checks whether that hash already exists in local storage. Duplicate operations are discarded without re-processing.
+
+<Note>
+Deduplication happens at the storage layer, not inside the sync protocol itself. This means an application-level event processor may receive the same logical event at most once per stream consumer, regardless of how many sync sessions have transferred it.
+</Note>
+
+## Topic-scoped sync
+
+Sync sessions are always scoped to a single `Topic`. A node that subscribes to multiple topics opens independent sync sessions for each one. This has several practical consequences:
+
+- **Bandwidth proportional to interest**: a node syncing a single chat topic does not receive data from unrelated topics.
+- **Independent progress**: a slow or offline peer for one topic does not block sync progress for other topics.
+- **Confidential discovery**: topic identifiers are random bytes. Nodes that do not know a topic ID cannot participate in its sync session, providing a lightweight confidentiality property without requiring encryption.
+
+<Warning>
+Topic IDs are not secret by default. Any node that learns a topic ID can attempt to participate in sync for that topic. For sensitive data, combine topic scoping with application-level encryption of body payloads.
+</Warning>

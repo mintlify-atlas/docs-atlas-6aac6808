@@ -1,0 +1,173 @@
+---
+title: "Integrating CRDTs with p2panda"
+description: "p2panda delivers operations as an ordered event stream; any CRDT can be materialised by processing that stream with idempotent, causally-aware logic."
+---
+
+p2panda does not ship a built-in CRDT implementation. Instead it provides an ordered, at-least-once event stream of operations, and leaves materialisation — the act of turning that stream into application state — to the developer. This makes p2panda compatible with any CRDT or event-sourced design: Last-Write-Wins registers, grow-only sets, two-phase sets, sequence CRDTs, JSON CRDTs, and custom domain-specific designs all work without modification to the p2panda stack.
+
+## Event sourcing pattern
+
+The recommended integration pattern is event sourcing: **commands** generate **events**, events are published into the p2panda topic stream, and an **event processor** applies each received event to produce materialised state.
+
+```plain
+[Command: "Update item"]
+    |
+    v
+ [Event: "Update"] -- [Event: "Create"] => Event Processor
+                                            |
+                                            v
+                                         Database with materialised state:
+                                         { <id>: "description", ... }
+```
+
+Crucially, the event processor handles both locally-generated events and events received from remote nodes through the same code path. p2panda makes no distinction between a message you published and a message synced from a peer — both arrive on the same `rx` stream as `StreamEvent::Processed`.
+
+## LWW register and 2P-Set: the todo example
+
+The collaborative todo list example in `p2panda/examples/todo.rs` demonstrates two well-known CRDTs composed together on a single topic stream.
+
+**Data types**
+
+```rust
+use std::collections::HashSet;
+use p2panda_core::{Hash, Timestamp, Topic};
+use serde::{Deserialize, Serialize};
+
+type TodoItemId = Hash;
+type TodoListId = Topic;
+
+/// Todo list message type which is replicated across nodes in the p2p network.
+#[derive(Debug, Serialize, Deserialize)]
+struct TodoEvent {
+    id: TodoItemId,
+    kind: TodoEventKind,
+}
+
+/// Changes we are applying to a todo list item.
+#[derive(Debug, Serialize, Deserialize)]
+enum TodoEventKind {
+    /// Sets the description of a todo list item.
+    Set { description: String },
+    /// Delete todo list item.
+    Delete,
+}
+
+/// Todo list with items inside.
+///
+/// The 2P-Set (Two-Phase Set) is used to mark "deleted" items in a second set named `tombstoned`.
+/// The difference between the two `items` and `tombstoned` sets is the 2P-set CRDT state with
+/// "remove-wins" semantics.
+struct TodoList {
+    id: TodoListId,
+    items: HashSet<TodoItem>,
+    tombstoned: HashSet<TodoItemId>,
+}
+```
+
+**Event processor (LWW + 2P-Set)**
+
+```rust
+pub fn process(&mut self, event: &TodoEvent, timestamp: Timestamp) {
+    let item = self.items.iter().find(|item| item.id == event.id).cloned();
+
+    // Ignore event if it is older than our latest write ("last-write wins") or if the addressed
+    // item was already tombstoned ("remove-wins").
+    if let Some(ref item) = item
+        && (item.timestamp > timestamp || self.tombstoned.contains(&item.id))
+    {
+        return;
+    }
+
+    match &event.kind {
+        TodoEventKind::Set { description } => {
+            // We've checked via the timestamp before that any event here is "later" than the
+            // current one, so we can simply replace what was in the state before with the
+            // "later" version.
+            self.items.replace(TodoItem {
+                id: event.id,
+                description: description.clone(),
+                timestamp,
+            });
+        }
+        TodoEventKind::Delete => {
+            // Remove item if it exists in our state.
+            if let Some(item) = item {
+                self.items.remove(&item);
+            }
+
+            // Add item to "removed" set for our 2P-Set (Two-Phase Set) CRDT.
+            self.tombstoned.insert(event.id);
+        }
+    }
+}
+```
+
+The `items` set holds current state (LWW register semantics: higher timestamp wins). The `tombstoned` set is the "removed" half of the 2P-Set — once an ID appears there it can never be re-inserted, implementing remove-wins semantics for deletions that may arrive out of order.
+
+<Tip>
+Using `Hash` as `TodoItemId` means two nodes that independently create an item with the same content will produce the same ID, which is a useful deduplication property. For items that must be unique per creator, derive the ID from the author's public key plus a local counter instead.
+</Tip>
+
+## Custom CRDT types
+
+Any type that implements `Serialize + Deserialize` can be used as the application message type passed to `node.stream::<T>(topic)`. p2panda serialises it to CBOR before creating the operation body.
+
+```rust
+// This will automatically serialise to CBOR.
+#[derive(Serialize, Deserialize)]
+enum CalendarMessage {
+    Update { title: String },
+    Delete,
+}
+
+let node = p2panda::spawn().await?;
+let topic = Topic::random();
+let (tx, rx) = node.stream::<CalendarMessage>(topic).await?;
+```
+
+This means you can define CRDT operation types as plain Rust enums or structs and let the stack handle encoding, delivery, ordering, and deduplication. The processor you write for `StreamEvent::Processed` receives already-decoded `CalendarMessage` values.
+
+## At-least-once delivery and idempotency
+
+<Warning>
+p2panda delivers operations with **at-least-once** semantics. An operation may be delivered more than once if an application crashes before acknowledging it. Every event processor **must be idempotent**: applying the same event a second time must produce the same state as applying it once.
+</Warning>
+
+The todo list `process` method above is idempotent:
+
+- The LWW timestamp check (`item.timestamp > timestamp`) ensures a re-delivered older event does not overwrite a newer one.
+- The 2P-Set tombstone check (`self.tombstoned.contains(&item.id)`) ensures a re-delivered `Set` event after a `Delete` event does not resurrect a deleted item.
+
+Design your CRDT update functions with these properties in mind from the start. Operations that mutate state without idempotency guards will produce incorrect results on replay.
+
+## Acknowledging after successful merge
+
+By default p2panda acknowledges operations automatically. For CRDT workloads where you need to guarantee the merge completed before marking an operation as processed — for example when writing materialised state to a database — use manual acknowledgement.
+
+```rust
+use p2panda::streams::StreamEvent;
+
+while let Some(event) = rx.next().await {
+    if let StreamEvent::Processed { operation, ack, .. } = event {
+        // Apply the CRDT merge to your local state.
+        todo_list.process(&operation.message(), operation.timestamp());
+
+        // Only acknowledge once the merge has been applied.
+        // If the process crashes before this line, the operation will be replayed on restart.
+        ack.send(()).ok();
+    }
+}
+```
+
+<Note>
+Unacknowledged operations are replayed automatically on the next startup. Combined with idempotent processors, this provides crash-safe at-least-once processing without requiring distributed transactions or external coordination.
+</Note>
+
+<CardGroup cols={2}>
+  <Card title="Operations" icon="bolt" href="/architecture/operations">
+    Learn about the Header/Body structure that carries your CRDT events.
+  </Card>
+  <Card title="Sync" icon="arrows-rotate" href="/architecture/sync">
+    Understand how missing operations reach your event processor after a node reconnects.
+  </Card>
+</CardGroup>

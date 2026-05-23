@@ -1,0 +1,204 @@
+---
+title: "p2panda-store — SQLite-backed persistence layer"
+description: "Generic store trait definitions and SQLite implementations for operations, logs, address books, cursors, orderer state, and group membership in p2panda."
+---
+
+`p2panda-store` provides both the abstract trait definitions and their concrete SQLite implementations for every kind of persistent state the p2panda stack needs: append-only log operations, address books, stream cursors, causal ordering buffers, topic mappings, and group membership. All SQLite implementations share a single `SqliteStore` handle that supports strictly serialised atomic transactions via an ergonomic `tx!` macro.
+
+## Installation
+
+```toml Cargo.toml
+[dependencies]
+p2panda-store = "0.6.1"
+```
+
+## Key exports
+
+| Export | Description |
+|--------|-------------|
+| `SqliteStore` | Cloneable SQLite store handle with connection pool and transaction provider. |
+| `SqliteStoreBuilder` | Builder for configuring and constructing a `SqliteStore`. |
+| `SqliteError` | Error type for SQLite interactions (connection, migration, encode/decode). |
+| `Transaction` | Trait defining `begin`, `commit`, and `rollback` semantics. |
+
+### Store sub-modules
+
+| Module | Description |
+|--------|-------------|
+| `address_book` | Node identity and transport information. |
+| `cursors` | Persistent stream cursor positions per topic. |
+| `groups` | Auth group membership state. |
+| `logs` | Log head tracking for efficient sync state comparison. |
+| `operations` | Storage and retrieval of append-only log `Operation` entries. |
+| `orderer` | Dependency tracking for causally ordered data sets. |
+| `topics` | Associations between topics, authors, and log identifiers. |
+
+## Creating a store
+
+### In-memory store (default)
+
+```rust
+use p2panda_store::SqliteStoreBuilder;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = SqliteStoreBuilder::new().build().await?;
+    Ok(())
+}
+```
+
+### File-backed store
+
+```rust
+use p2panda_store::SqliteStoreBuilder;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = SqliteStoreBuilder::new()
+        .database_url("sqlite:myapp.db")
+        .max_connections(8)
+        .build()
+        .await?;
+    Ok(())
+}
+```
+
+The `database_url` value must be a valid [SQLite URI](https://sqlite.org/uri.html). Database files are created automatically and migrations are applied on startup.
+
+<Note>
+The default in-memory URL is `sqlite::memory:`. Each call to `SqliteStoreBuilder::new().build()` creates a fresh in-memory database. Use `database_url` to persist data between process restarts.
+</Note>
+
+## SqliteStoreBuilder parameters
+
+<AccordionGroup>
+  <Accordion title="Builder methods">
+    | Method | Default | Description |
+    |--------|---------|-------------|
+    | `.database_url(url)` | `sqlite::memory:` | SQLite URI for the database file. |
+    | `.max_connections(n)` | `16` | Maximum connections in the connection pool. |
+    | `.create_database(bool)` | `true` | Create the database file if it does not exist. |
+    | `.run_default_migrations(bool)` | `true` | Apply pending schema migrations on startup. |
+    | `.build()` | — | Async; returns `Result<SqliteStore, SqliteError>`. |
+  </Accordion>
+</AccordionGroup>
+
+## SqliteStore API
+
+```rust
+// SqliteStore is cheaply cloneable — all clones share the same pool.
+let store2 = store.clone();
+
+// Execute a read-only query directly (no transaction needed).
+store.execute(async |pool| {
+    // Use pool: &sqlx::SqlitePool
+    Ok(())
+}).await?;
+
+// Execute a write query inside a transaction.
+let permit = store.begin().await?;
+store.tx(async |tx| {
+    // Use tx: &mut Transaction
+    Ok(())
+}).await?;
+store.commit(permit).await?;
+```
+
+## Transactional operations example
+
+The `tx!` macro groups several store operations atomically. The example below queries the latest log entry, builds a new operation, associates the topic, and inserts the operation in a single transaction.
+
+```rust
+use p2panda_core::{
+    Body, Hash, Header, Operation, SigningKey, Timestamp, Topic, VerifyingKey,
+};
+use p2panda_store::logs::LogStore;
+use p2panda_store::operations::OperationStore;
+use p2panda_store::topics::TopicStore;
+use p2panda_store::{SqliteStore, tx};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let store = SqliteStore::temporary().await;
+    let log_id: u64 = 2;
+    let topic = Topic::random();
+    let signing_key = SigningKey::generate();
+    let body = Body::new(b"Transaction! Yay!");
+
+    let operation = tx!(store, {
+        let (seq_num, backlink) = <SqliteStore as LogStore<
+            Operation<()>,
+            VerifyingKey,
+            u64,
+            u64,
+            Hash,
+        >>::get_latest_entry_tx(
+            &store,
+            &signing_key.verifying_key(),
+            &log_id,
+        )
+        .await?
+        .map(|op| (op.header.seq_num + 1, Some(op.hash)))
+        .unwrap_or((0, None));
+
+        let mut header = Header {
+            version: 1,
+            verifying_key: signing_key.verifying_key(),
+            signature: None,
+            payload_size: body.size(),
+            payload_hash: Some(body.hash()),
+            timestamp: Timestamp::now(),
+            seq_num,
+            backlink,
+            extensions: (),
+        };
+        header.sign(&signing_key);
+        let hash = header.hash();
+
+        let operation = Operation {
+            hash,
+            header: header.clone(),
+            body: Some(body),
+        };
+
+        <SqliteStore as TopicStore<Topic, VerifyingKey, u64>>::associate(
+            &store,
+            &topic,
+            &signing_key.verifying_key(),
+            &log_id,
+        )
+        .await?;
+
+        store.insert_operation(&hash, &operation, &log_id).await?;
+
+        operation
+    });
+
+    Ok(())
+}
+```
+
+## Transaction semantics
+
+SQLite enforces strictly serialised write transactions. `SqliteStore` makes this explicit with a `Semaphore`-backed `TransactionPermit`. Any concurrent caller to `begin()` will await until the current permit holder calls `commit()` or `rollback()`. If a permit is dropped without committing (for example due to an early return or panic), the transaction is automatically rolled back.
+
+<Warning>
+Avoid holding a transaction permit while performing unrelated async work. Other processes that need to write will be blocked for the duration.
+</Warning>
+
+## Feature flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `sqlite` | on | Enables `SqliteStore`, `SqliteStoreBuilder`, and `SqliteError`. |
+| `macros` | on | Enables the `tx!` transactional helper macro. |
+| `test_utils` | off | Enables `SqliteStore::temporary()` and other test helpers. |
+
+<CardGroup cols={2}>
+  <Card title="p2panda-core" href="/crates/p2panda-core">
+    Operation, Header, and Hash types stored by this crate.
+  </Card>
+  <Card title="p2panda" href="/crates/p2panda">
+    High-level Node API that configures a `SqliteStore` via `NodeBuilder`.
+  </Card>
+</CardGroup>

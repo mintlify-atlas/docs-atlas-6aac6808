@@ -1,0 +1,102 @@
+---
+title: "Node and topic discovery in p2panda"
+description: "p2panda uses mDNS for zero-config LAN discovery and a random-walk algorithm with bootstrap nodes for Internet-scale peer and topic discovery."
+---
+
+Before two p2panda nodes can sync, they first need to find each other. Discovery in p2panda is layered: multicast DNS (mDNS) handles the common case of devices on the same local network with no configuration required, while a random-walk algorithm built on top of bootstrap nodes and iroh relay servers extends reachability across the Internet. Both mechanisms are topic-aware — a node announces interest in specific topic identifiers rather than broadcasting its existence globally, which limits exposure and keeps discovery traffic proportional to actual subscriptions.
+
+## mDNS: local network discovery
+
+mDNS lets nodes on the same LAN find each other without any pre-shared addresses or central infrastructure. p2panda uses mDNS to announce node IDs and the topic identifiers a node is currently subscribed to.
+
+There are two operating modes, controlled by `MdnsDiscoveryMode`:
+
+<CardGroup cols={2}>
+  <Card title="Active mode" icon="broadcast-tower">
+    The node both sends mDNS announcements on the local multicast group and listens for announcements from others. Use this when the node is a full participant that should be discoverable by peers on the same network segment.
+  </Card>
+  <Card title="Passive mode" icon="ear-listen">
+    The node only listens for mDNS announcements without sending any of its own. Use this for nodes that want to discover peers without advertising their own presence — for example, a read-only observer or a node behind a restrictive firewall.
+  </Card>
+</CardGroup>
+
+<Note>
+mDNS announcements are limited to the local network segment. They do not traverse routers or NAT boundaries. For any cross-Internet scenario, you must also configure at least one bootstrap node and a relay URL.
+</Note>
+
+mDNS discovery triggers automatically when a node subscribes to a topic via `node.stream(topic)`. No additional configuration is required for LAN-only deployments — calling `p2panda::spawn().await` produces a node with mDNS active by default.
+
+## Random-walk discovery: Internet-scale
+
+For nodes that are not on the same physical network, p2panda uses a random-walk algorithm. The algorithm works as follows:
+
+<Steps>
+  <Step title="Connect to a bootstrap node">
+    On startup the node dials one or more pre-configured bootstrap nodes. Bootstrap nodes are well-known, stable peers whose addresses are embedded in the application at build time.
+  </Step>
+  <Step title="Announce topic interest">
+    The node announces the topic identifiers it cares about to the bootstrap node. The bootstrap node records this interest and can share it with other connecting nodes.
+  </Step>
+  <Step title="Receive introductions">
+    The bootstrap node returns addresses of other nodes that have announced interest in the same topics. The node dials these peers directly.
+  </Step>
+  <Step title="Walk the graph">
+    Each newly connected peer may in turn introduce additional peers, gradually expanding the set of known nodes interested in shared topics. The walk continues until the node has enough direct connections for reliable sync.
+  </Step>
+</Steps>
+
+Direct connections use QUIC via iroh. When a direct peer-to-peer path is not available (for example, both nodes are behind NAT), iroh relay servers facilitate connection establishment by acting as rendezvous points. Once a direct path is established, the relay is no longer on the data path.
+
+## Configuring bootstrap nodes
+
+Bootstrap nodes are configured on the `NodeBuilder` using `bootstrap` and `relay_url`:
+
+```rust
+// Public key of node helping to bootstrap the network for any topic.
+let bootstrap_id = "1021253b4ccdfba6cac196d2b9fa6ebb605b747bcd502d6bf1d46887f04ec913".parse()?;
+
+// URL of iroh relay to establish a direct connection over the Internet.
+let relay_url: RelayUrl = "https://my.relay.link".parse()?;
+
+// Persist SQLite database under given file path.
+let database_url = "db.sqlite";
+
+// Check the builder docs for more information on configuration options.
+let node = p2panda::builder()
+    .database_url(database_url)
+    .bootstrap(bootstrap_id, relay_url.clone())
+    .relay_url(relay_url)
+    .spawn()
+    .await?;
+```
+
+The `bootstrap` call accepts a `NodeId` (the bootstrap node's Ed25519 public key) and a `RelayUrl`. Multiple bootstrap nodes can be added by chaining additional `.bootstrap(...)` calls on the builder.
+
+## Bootstrap node best practices
+
+<AccordionGroup>
+  <Accordion title="Run at least two bootstrap nodes">
+    A single bootstrap node is a single point of failure. If it is unreachable, newly started application instances cannot perform their first random-walk step and will be unable to find peers over the Internet. Running two or more bootstrap nodes in separate failure domains (different cloud providers, different geographic regions) provides redundancy.
+  </Accordion>
+  <Accordion title="Keep bootstrap nodes lightweight">
+    Bootstrap nodes participate in discovery but do not need to store or sync application data. They can be deployed as small VMs or containers. Their primary resource requirement is network availability and a stable public IP or DNS address, not storage.
+  </Accordion>
+  <Accordion title="Rotate bootstrap node keys carefully">
+    The bootstrap node's public key is embedded in application binaries as a `NodeId`. Changing this key requires shipping a new application version. Plan key rotation in advance and keep old bootstrap nodes alive long enough for users to update.
+  </Accordion>
+  <Accordion title="Combine with relay servers">
+    Bootstrap nodes help peers find each other; relay servers help peers connect to each other through NAT. Both are needed for reliable Internet operation. The `relay_url` can point to a public iroh relay or to one you operate yourself.
+  </Accordion>
+</AccordionGroup>
+
+<Warning>
+Do not embed bootstrap node private keys in application code. The private key of a bootstrap node should be protected just like any other server secret — only the public key (`NodeId`) belongs in application configuration.
+</Warning>
+
+## Confidential discovery
+
+Topic IDs are random byte strings with no inherent structure. A node that does not know a topic ID cannot request peer introductions for that topic from a bootstrap node. This provides lightweight confidentiality: discovery leaks only that a node is interested in _some_ topic, not _which_ topic, to peers that do not already know the ID.
+
+<Tip>
+For higher confidentiality guarantees, generate topic IDs using a key derivation function from a shared secret (e.g. HKDF over a pre-shared passphrase). Nodes that share the secret can independently derive the same topic ID; everyone else sees an opaque random value.
+</Tip>

@@ -1,0 +1,95 @@
+---
+title: "p2panda-spaces — encrypted group spaces API"
+description: "High-level API combining p2panda-auth group management and p2panda-encryption for creating encrypted spaces with multi-device support and nested groups."
+---
+
+`p2panda-spaces` integrates `p2panda-auth` group management with `p2panda-encryption` data encryption into a single, higher-level API for creating and managing encrypted collaboration spaces. A "space" is an encryption context shared by a dynamic group of actors — members can be added or removed, keys are rotated automatically on membership changes, and private space identifiers prevent unauthorised discovery. The main entry point is the `Manager` struct, from which groups and spaces are created and managed.
+
+## Installation
+
+```toml Cargo.toml
+[dependencies]
+p2panda-spaces = "0.6.1"
+```
+
+## Key exports
+
+<AccordionGroup>
+  <Accordion title="Top-level types">
+    | Export | Description |
+    |--------|-------------|
+    | `Config` | Configuration for a `Manager` instance. |
+    | `Credentials` | Identity and signing credentials for a local actor. |
+    | `Event` | Events emitted by space and group operations. |
+    | `SpacesArgs` | Arguments passed alongside application messages for spaces-level processing. |
+    | `ActorId` | Identifier for a participant in a space (wraps an Ed25519 public key). |
+    | `OperationId` | Identifier for a group or space operation. |
+  </Accordion>
+
+  <Accordion title="Public modules">
+    | Module | Description |
+    |--------|-------------|
+    | `manager` | `Manager` struct — primary entry point for creating and managing spaces and groups. |
+    | `group` | Group state and membership types. |
+    | `space` | Space state, identifiers, and encryption contexts. |
+    | `identity` | Identity types for actors (devices and users). |
+    | `traits` | Trait interfaces for custom storage and message ordering backends. |
+  </Accordion>
+</AccordionGroup>
+
+## Features
+
+- **Decentralised group key agreement** with forward secrecy (message encryption) and post-compromise security (data encryption)
+- **Decentralised group management** via `p2panda-auth` with robust conflict resolution for concurrent membership changes
+- **Private space identifiers** that are not revealed to non-members during discovery
+- **Group reuse across encryption boundaries** — the same group can govern multiple spaces
+- **Nested groups** for modelling multi-device profiles: a single logical user can have multiple devices, each with its own key material
+- **Generic over message type** — bring your own application message format
+
+## Requirements
+
+Messages processed by `p2panda-spaces` must satisfy two properties:
+
+1. **Causally ordered** — messages must be delivered in causal order. Use `p2panda-stream`'s orderer processor or ensure ordering at the application layer.
+2. **Signed and verified** — every message must be signed by its author and verified before processing.
+
+## Usage
+
+```rust
+use p2panda_spaces::manager::Manager;
+use p2panda_spaces::{Config, Credentials};
+
+// Create a manager with your local actor credentials.
+let credentials = Credentials::new(signing_key);
+let config = Config::default();
+
+let mut manager = Manager::new(credentials, config, store).await?;
+
+// Create a new group and space.
+let group_id = manager.create_group().await?;
+let space_id = manager.create_space(group_id).await?;
+
+// Add a member to the group.
+manager.add_member(group_id, member_actor_id, access).await?;
+```
+
+## Relationship to p2panda-auth and p2panda-encryption
+
+`p2panda-spaces` is the recommended way to use `p2panda-auth` and `p2panda-encryption` together. It handles the wiring between group membership state and encryption key rotation automatically:
+
+- When a member is **removed** from a group, the encryption key for all associated spaces is automatically rotated so the removed member cannot decrypt new data.
+- When a member is **added**, they are invited into the current encryption context via the X3DH key agreement protocol.
+- The `Manager` coordinates both group and encryption state in atomic transactions, minimising the risk of inconsistency after a crash.
+
+<Note>
+`p2panda-spaces` is under active development and the API is not yet considered stable for production use. It represents the intended high-level integration point for secure, decentralised collaboration applications.
+</Note>
+
+<CardGroup cols={2}>
+  <Card title="p2panda-auth" href="/crates/p2panda-auth">
+    Group membership and permissions layer used internally by p2panda-spaces.
+  </Card>
+  <Card title="p2panda-encryption" href="/crates/p2panda-encryption">
+    Encryption scheme layer used internally by p2panda-spaces.
+  </Card>
+</CardGroup>

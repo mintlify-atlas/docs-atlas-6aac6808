@@ -1,0 +1,142 @@
+---
+title: "How p2panda operations work"
+description: "Operations are the core data type in p2panda: a signed Header plus an optional Body that forms a tamper-proof, append-only log using Ed25519 and BLAKE3."
+---
+
+Every piece of data exchanged between p2panda nodes travels as an **Operation**. An operation bundles a cryptographically signed `Header` — which carries all ordering, authentication, and extension metadata — with an optional `Body` that holds the raw application payload bytes. This separation means header chains remain verifiable even after a body is deleted, and it enables "off-chain" or lazy payload delivery over bandwidth-constrained links.
+
+## Header and body structure
+
+The `Header` struct is the authoritative record of an operation. It contains the author's public key, a sequence number that places the operation within a log, an optional backlink hash pointing to the previous operation, and an `extensions` field that applications can use to attach custom metadata.
+
+```rust
+use p2panda_core::{Body, Header, Operation, SigningKey, Timestamp};
+
+// Every operation is cryptographically authenticated by an author by signing it with an
+// Ed25519 key pair. This method generates a new private key for us which needs to be securely
+// stored for re-use.
+let signing_key = SigningKey::generate();
+
+// Operations consist of a body (with the actual application data) and a header,
+// enhancing the data to be used in distributed networks.
+let body = Body::new("Hello, Sloth!".as_bytes());
+let mut header = Header {
+    version: 1,
+    verifying_key: signing_key.verifying_key(),
+    signature: None,
+    payload_size: body.size(),
+    payload_hash: Some(body.hash()),
+    timestamp: Timestamp::now(),
+    seq_num: 0,
+    backlink: None,
+    extensions: (),
+};
+
+// Sign the header with the author's private key. From now on it's ready to be sent!
+header.sign(&signing_key);
+```
+
+<Note>
+`payload_hash` stores the BLAKE3 hash of the body inside the signed header. This means a node can verify body integrity without trusting the transport layer, and the header chain stays intact even if a body is later pruned.
+</Note>
+
+The `Body` wraps arbitrary bytes — the application decides what encoding to use inside it. p2panda itself serialises `Body` contents as CBOR when using the high-level Node API, but any byte slice is accepted at the `p2panda-core` level.
+
+## Append-only logs
+
+Each author maintains one or more **append-only logs**. Every new operation in a log increments `seq_num` by one and sets `backlink` to the BLAKE3 hash of the previous operation's header. This forms a cryptographically linked list.
+
+<CardGroup cols={2}>
+  <Card title="seq_num" icon="list-ol">
+    Monotonically increasing counter starting at 0. Used to detect gaps and order operations within a single author's log.
+  </Card>
+  <Card title="backlink" icon="link">
+    Hash of the preceding header. `None` for the first operation in a log. Any tampering with history breaks the chain.
+  </Card>
+  <Card title="Single-writer" icon="pen">
+    Each log has exactly one author. Multi-writer collaboration is achieved by combining independent single-writer logs at the application layer.
+  </Card>
+  <Card title="Fork-tolerant" icon="code-fork">
+    The protocol detects forks (two operations with the same `seq_num`) and handles them without corrupting the rest of the log.
+  </Card>
+</CardGroup>
+
+## Cryptographic guarantees
+
+p2panda uses well-established, audited primitives throughout:
+
+<AccordionGroup>
+  <Accordion title="Ed25519 signatures">
+    Every header is signed with the author's Ed25519 private key before transmission. Any peer can verify the signature using the `verifying_key` embedded in the header itself. Signing clears any existing signature field, serialises the header to CBOR, then sets `signature` to the resulting 64-byte Ed25519 signature.
+  </Accordion>
+  <Accordion title="BLAKE3 hashing">
+    Operation identity (the "Operation Id") is the BLAKE3 hash of the CBOR-encoded header bytes. The same hash is stored in the `backlink` field of the next operation, chaining the log together. `payload_hash` is likewise a BLAKE3 hash of the body bytes, stored inside the signed header so body integrity can be checked independently.
+  </Accordion>
+  <Accordion title="CBOR encoding">
+    All headers are encoded with CBOR before signing and hashing. Optional fields with `None` values are omitted from the encoding, keeping wire size minimal. The `Header::to_bytes()` method produces the canonical encoding used for both signing and hashing.
+  </Accordion>
+</AccordionGroup>
+
+## Extensions
+
+The `extensions` field is a generic type parameter on `Header<E>`. By default it is `()` (zero-sized, no extra fields). Applications define a struct that implements `Extensions` and `Serialize`/`Deserialize`, then embed custom fields into every header at zero protocol overhead.
+
+p2panda ships a built-in `PruneFlag` extension that marks a specific operation as a garbage-collection boundary. Nodes are allowed to delete all operations before that point.
+
+```rust
+use p2panda_core::{Body, Extension, Header, SigningKey, PruneFlag, Timestamp};
+use serde::{Serialize, Deserialize};
+
+let signing_key = SigningKey::generate();
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct CustomExtensions {
+    prune_flag: PruneFlag,
+}
+
+impl Extension<PruneFlag> for CustomExtensions {
+    fn extract(header: &Header<Self>) -> Option<PruneFlag> {
+        Some(header.extensions.prune_flag.clone())
+    }
+}
+
+let extensions = CustomExtensions {
+    prune_flag: PruneFlag::new(true),
+};
+
+let body = Body::new("Prune from here please!".as_bytes());
+let mut header = Header {
+    version: 1,
+    verifying_key: signing_key.verifying_key(),
+    signature: None,
+    payload_size: body.size(),
+    payload_hash: Some(body.hash()),
+    timestamp: Timestamp::now(),
+    seq_num: 0,
+    backlink: None,
+    extensions,
+};
+
+header.sign(&signing_key);
+
+let prune_flag: PruneFlag = header.extension().unwrap();
+assert!(prune_flag.is_set())
+```
+
+<Tip>
+Extensions can encode any serialisable data: tombstones for explicit deletion, group encryption envelopes, capability tokens, or domain-specific routing hints. There is no limit on the number of fields as long as the total header stays practical to transmit.
+</Tip>
+
+## Validation functions
+
+`p2panda-core` exports three standalone validation helpers that can be used at any layer of the stack:
+
+| Function | What it checks |
+|---|---|
+| `validate_header` | Signature is present and valid; `payload_hash` is consistent with `payload_size`. |
+| `validate_backlink` | The `backlink` field matches the hash of the claimed previous operation; `seq_num` is exactly one greater. |
+| `validate_operation` | Combines header and backlink validation into a single call suitable for full operation ingestion. |
+
+<Warning>
+Always call `validate_operation` (or at minimum `validate_header`) before persisting or forwarding an operation received from an untrusted peer. Skipping validation opens the node to log-poisoning attacks.
+</Warning>

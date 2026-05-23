@@ -1,0 +1,97 @@
+---
+title: "Add group encryption to your application"
+description: "Integrate p2panda-encryption for group E2EE: choose Data or Message encryption, understand key bundles, the 2SM protocol, and security limitations."
+---
+
+`p2panda-encryption` adds end-to-end encryption to group applications built on top of p2panda. It provides two distinct encryption schemes suited to different use cases: Data Encryption for content that late-joining members should still be able to read, and Message Encryption for strong per-message forward secrecy similar to Signal's Double Ratchet. Both schemes are designed for decentralised networks where group members may be offline concurrently and group membership changes — adds, removals, promotions — can happen without central coordination.
+
+## Add the dependency
+
+<CodeGroup>
+
+```toml Cargo.toml (Data Encryption)
+[dependencies]
+p2panda-encryption = { version = "0.6.1", features = ["data_scheme"] }
+```
+
+```toml Cargo.toml (Message Encryption)
+[dependencies]
+p2panda-encryption = { version = "0.6.1", features = ["message_scheme"] }
+```
+
+```toml Cargo.toml (both schemes)
+[dependencies]
+p2panda-encryption = { version = "0.6.1", features = ["data_scheme", "message_scheme"] }
+```
+
+</CodeGroup>
+
+The `data_scheme` feature is included by default. Enable `message_scheme` separately if you need the ratchet-based approach.
+
+## Choosing an encryption scheme
+
+### Data Encryption
+
+Data Encryption re-uses the same symmetric key — XChaCha20-Poly1305 — for the entire group until the key is rotated. A key rotation is triggered when the group membership changes, most importantly when a member is removed. Members who join the group at any point can decrypt all previously created content as long as the encryption keys remain in the network.
+
+**When to use it:** Knowledge bases, wikis, booking tools, or any application where late-joining members need access to historical content.
+
+**Post-compromise security (PCS):** A removed member cannot decrypt data created after their removal because the key is rotated. Applications can optionally discard old keys for forward secrecy if historical access by removed members is also undesired.
+
+### Message Encryption
+
+Message Encryption establishes a per-member [Double Ratchet](https://en.wikipedia.org/wiki/Double_Ratchet_Algorithm) messaging ratchet, deriving a fresh symmetric key for each message. After the ciphertext of a message is decrypted, its key is discarded, giving strong forward secrecy for every individual message.
+
+**When to use it:** Group chats, real-time collaboration tools, or any context where a leaked key must not compromise past messages.
+
+**Trade-off:** Strong forward secrecy comes with UX implications — users who are offline for an extended period may need to go through a re-synchronisation step to re-establish their ratchet state.
+
+## Key bundles and pre-keys
+
+Before a peer can be invited into an encrypted group, they must publish a key bundle to the network. A key bundle contains:
+
+- An **identity key** (X25519 public key derived from the peer's signing key)
+- A **signed pre-key** along with a signature verified with XEdDSA
+- An optional **one-time pre-key** for stronger forward secrecy during the initial handshake
+
+Two bundle types are available:
+
+```rust
+use p2panda_encryption::key_bundle::{LongTermKeyBundle, OneTimeKeyBundle};
+```
+
+`OneTimeKeyBundle` includes a one-time pre-key that is consumed in a single key agreement and discarded, providing the strongest forward secrecy for initial rounds. `LongTermKeyBundle` uses a signed pre-key valid for a configurable lifetime — useful when distributing one-time pre-keys at scale is impractical.
+
+Pre-key lifetime is set on the `PreKey` via the `Lifetime` type. Bundles with expired or not-yet-valid lifetimes are automatically rejected during verification.
+
+## 2SM key agreement
+
+Both encryption schemes rely on the **Two-Party Secure Messaging (2SM)** key agreement protocol as specified in the paper ["Key Agreement for Decentralized Secure Group Messaging with Strong Security Guarantees"](https://eprint.iacr.org/2020/1281.pdf) (Weidner et al., 2020).
+
+The protocol works in two phases:
+
+1. **Initial round (X3DH):** The inviting peer uses the recipient's published key bundle to derive a shared secret via the [Extended Triple Diffie-Hellman](https://signal.org/docs/specifications/x3dh/) protocol. Forward secrecy in this round is bounded by the lifetime of the pre-key used.
+
+2. **Subsequent rounds (HPKE):** Each subsequent 2SM round uses a single secret key derived from an ephemeral key pair that is immediately discarded after use. This gives strong per-round forward secrecy, independent of which pre-key was used in the initial round.
+
+The protocol scales efficiently: distributing a new group secret after a membership change (for example on member removal) requires only `O(n)` operations where `n` is the current group size.
+
+```rust
+use p2panda_encryption::two_party;
+```
+
+## Security considerations
+
+<Warning>
+`p2panda-encryption` has **not yet received a security audit**. We do not recommend using it for high-risk use cases — especially those involving potentially compromised devices or transport channels — until an independent audit is complete.
+</Warning>
+
+### Metadata is not encrypted
+
+In the current implementation, all group control messages (add, remove, promote, demote, key agreement rounds) are transmitted **unencrypted**. Application data is fully protected, but an adversary with access to the network can observe which cryptographic identities are members of a group. While cryptographic identities are not necessarily tied to real-world persons, this metadata could be sufficient to reveal group membership in sensitive contexts.
+
+Work is underway to encrypt control messages and to protect sender/recipient information, with an acknowledgement that doing so involves performance trade-offs and additional UX requirements.
+
+### No post-quantum security
+
+`p2panda-encryption` is **not** resistant to harvest-now-decrypt-later (HNDL) quantum adversaries. It does not currently use any post-quantum cryptographic primitives.

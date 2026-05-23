@@ -1,0 +1,80 @@
+---
+title: "p2panda: local-first peer-to-peer for Rust"
+description: "p2panda is a modular Rust library suite for building privacy-respecting, offline-first p2p apps with encryption, access control, and CRDT support."
+---
+
+p2panda gives you everything you need to build modern, privacy-respecting local-first applications. It takes a modular approach — pick the crates you need and integrate them with minimal friction, without locking you into a rigid framework.
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get a p2p node running and publishing messages in minutes
+  </Card>
+  <Card title="Core concepts" icon="lightbulb" href="/concepts">
+    Understand operations, topics, and the local-first model
+  </Card>
+  <Card title="Node setup guide" icon="server" href="/guides/node-setup">
+    Configure your node with persistence, relay servers, and bootstrap peers
+  </Card>
+  <Card title="Crate reference" icon="book" href="/crates/p2panda">
+    Explore the full API surface of every p2panda crate
+  </Card>
+</CardGroup>
+
+## What p2panda provides
+
+p2panda is built around a high-level **Node API** that orchestrates all the pieces — networking, discovery, sync, event streaming, causal ordering, and storage — in one ergonomic Rust API. For lower-level use cases, each crate can be used independently.
+
+<CardGroup cols={3}>
+  <Card title="Networking" icon="network-wired" href="/crates/p2panda-net">
+    QUIC-based p2p networking with mDNS and gossip via iroh
+  </Card>
+  <Card title="Sync" icon="arrows-rotate" href="/crates/p2panda-sync">
+    Local-first, eventually consistent sync for append-only logs
+  </Card>
+  <Card title="Discovery" icon="magnifying-glass" href="/crates/p2panda-discovery">
+    Confidential topic and node discovery without central coordination
+  </Card>
+  <Card title="Encryption" icon="lock" href="/crates/p2panda-encryption">
+    Group encryption with post-compromise security and forward secrecy
+  </Card>
+  <Card title="Access control" icon="shield-halved" href="/crates/p2panda-auth">
+    Decentralised group management with per-member permissions
+  </Card>
+  <Card title="Blob storage" icon="file" href="/crates/p2panda-blobs">
+    Content-addressed large file transfer and storage
+  </Card>
+</CardGroup>
+
+## Key characteristics
+
+- **Broadcast-only by design** — data is compatible with post-internet communication infrastructure like packet radio, LoRa, BLE, or a USB stick
+- **Transport-agnostic** — today runs over QUIC/iroh; designed to support mesh and radio transports in the future
+- **CRDT-compatible** — operation logs work with any CRDT or application data type
+- **Fork-tolerant** — single-writer logs with pruning and multi-writer causal ordering
+- **Crash-resilient** — at-least-once delivery with acknowledgements and replay
+
+<Warning>
+p2panda is under active development. APIs are not yet considered stable for production use. Breaking changes may occur before v1.0.0.
+</Warning>
+
+## Installation
+
+Add the high-level Node API to your Rust project:
+
+```toml Cargo.toml
+[dependencies]
+p2panda = "0.6.1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+```
+
+Or pick individual crates for lower-level use:
+
+```toml Cargo.toml
+[dependencies]
+p2panda-core = "0.6.1"
+p2panda-net = "0.6.1"
+p2panda-sync = "0.6.1"
+p2panda-encryption = "0.6.1"
+p2panda-auth = "0.6.1"
+```

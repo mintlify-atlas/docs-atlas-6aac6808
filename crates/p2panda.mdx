@@ -1,0 +1,210 @@
+---
+title: "p2panda — high-level peer-to-peer Node API"
+description: "The top-level crate that orchestrates the full p2panda stack: networking, discovery, sync, causal ordering, storage, and event streaming in one API."
+---
+
+The `p2panda` crate is the opinionated, batteries-included entry point for building decentralised peer-to-peer and local-first applications. It wires together every lower-level p2panda module — networking over QUIC/iroh, mDNS discovery, eventually-consistent log sync, causal ordering, SQLite persistence, and an event-streaming consumer model — behind a single `Node` type and two free functions: `spawn()` and `builder()`.
+
+## Installation
+
+```toml Cargo.toml
+[dependencies]
+p2panda = "0.6.1"
+```
+
+## Quick start
+
+```rust
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Spawn a default, in-memory node with mDNS discovery.
+    let node = p2panda::spawn().await?;
+
+    // Create a random topic and open a publish/subscribe stream.
+    let topic = p2panda::Topic::random();
+    let (tx, rx) = node.stream(topic).await?;
+
+    tx.publish("Hello, Panda!".to_string()).await?;
+    Ok(())
+}
+```
+
+## Key exports
+
+<AccordionGroup>
+  <Accordion title="Free functions">
+    | Symbol | Description |
+    |--------|-------------|
+    | `spawn() -> Result<Node, SpawnError>` | Spawns a `Node` with default in-memory config and mDNS. |
+    | `builder() -> NodeBuilder` | Returns a `NodeBuilder` for customised configuration. |
+  </Accordion>
+
+  <Accordion title="Node methods">
+    | Method | Description |
+    |--------|-------------|
+    | `node.stream::<M>(topic)` | Opens an eventually-consistent topic stream. Returns `(StreamPublisher<M>, StreamSubscription<M>)`. |
+    | `node.stream_from::<M>(topic, from)` | Same as `stream()` but with a custom `StreamFrom` starting position. |
+    | `node.ephemeral_stream::<M>(topic)` | Opens an ephemeral (gossip, non-persisted) stream. |
+    | `node.event_stream()` | Returns a `Stream<Item = SystemEvent>` of network events (discovery, etc.). |
+    | `node.id()` | Returns the node's `NodeId` (public key). |
+    | `node.network_id()` | Returns the `NetworkId` in use. |
+    | `node.insert_bootstrap(node_id, relay_url)` | Adds a bootstrap node to the local address book. |
+  </Accordion>
+
+  <Accordion title="NodeBuilder methods">
+    | Method | Description |
+    |--------|-------------|
+    | `.signing_key(key)` | Set the Ed25519 private key (default: randomly generated). |
+    | `.database_url(url)` | SQLite URI for persistent storage (default: in-memory). |
+    | `.database_pool(pool)` | Supply an existing `SqlitePool`. |
+    | `.ack_policy(policy)` | Set `AckPolicy::Automatic` (default) or `AckPolicy::Explicit`. |
+    | `.network_id(id)` | Override the 32-byte network identifier. |
+    | `.relay_url(url)` | Add an iroh relay URL for NAT traversal. |
+    | `.bootstrap(node_id, relay_url)` | Register a bootstrap node. |
+    | `.mdns_mode(mode)` | Set mDNS discovery to `Active`, `Passive`, or `Disabled`. |
+    | `.bind_ip_v4(ip)` / `.bind_port_v4(port)` | Bind the IPv4 socket. |
+    | `.bind_ip_v6(ip)` / `.bind_port_v6(port)` | Bind the IPv6 socket. |
+    | `.discovery_config(cfg)` | Fine-tune random-walk discovery parameters. |
+    | `.gossip_config(cfg)` | Fine-tune gossip broadcast parameters. |
+    | `.spawn()` | Consume the builder and launch the `Node`. |
+  </Accordion>
+
+  <Accordion title="Re-exported types">
+    | Type | Source crate |
+    |------|-------------|
+    | `Topic`, `Hash`, `SigningKey`, `VerifyingKey`, `Cursor` | `p2panda-core` |
+    | `NetworkId`, `NodeId` | `p2panda-net` |
+    | `RelayUrl`, `EndpointAddr` | `p2panda-net` (iroh) |
+    | `NodeBuilder` | `p2panda::builder` |
+    | `AckPolicy` | `p2panda::node` |
+  </Accordion>
+</AccordionGroup>
+
+## AckPolicy enum
+
+Every `StreamSubscription` is stateful and tracks acknowledged operations in SQLite. The policy controls when acknowledgement happens.
+
+```rust
+pub enum AckPolicy {
+    /// Node assumes acknowledgment on delivery (default).
+    Automatic,
+    /// Each message must be explicitly acknowledged by the application.
+    Explicit,
+}
+```
+
+<Tip>
+Switch to `AckPolicy::Explicit` and acknowledge only after successful application processing to get at-least-once delivery guarantees across crashes.
+</Tip>
+
+## StreamFrom enum
+
+Controls the replay starting position when calling `stream_from()`.
+
+```rust
+// Resume from the stream frontier (default, used by stream()).
+node.stream_from(topic, StreamFrom::Frontier).await?;
+
+// Replay all known operations from the beginning.
+node.stream_from(topic, StreamFrom::Start).await?;
+
+// Resume from a specific cursor position.
+node.stream_from(topic, StreamFrom::Cursor(my_cursor)).await?;
+```
+
+## Usage examples
+
+### Configured node
+
+```rust
+use p2panda::RelayUrl;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let bootstrap_id =
+        "1021253b4ccdfba6cac196d2b9fa6ebb605b747bcd502d6bf1d46887f04ec913".parse()?;
+    let relay_url: RelayUrl = "https://my.relay.link".parse()?;
+
+    let node = p2panda::builder()
+        .database_url("db.sqlite")
+        .bootstrap(bootstrap_id, relay_url.clone())
+        .relay_url(relay_url)
+        .spawn()
+        .await?;
+
+    Ok(())
+}
+```
+
+### Typed application messages
+
+Messages are automatically serialised to CBOR, so any `serde`-compatible type works.
+
+```rust
+use p2panda::Topic;
+use serde::{Serialize, Deserialize};
+
+#[derive(Serialize, Deserialize)]
+enum CalendarMessage {
+    Update { title: String },
+    Delete,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let node = p2panda::spawn().await?;
+    let topic = Topic::random();
+    let (tx, rx) = node.stream::<CalendarMessage>(topic).await?;
+    Ok(())
+}
+```
+
+### Awaiting publish processing
+
+```rust
+let (tx, _) = node.stream::<String>(topic).await?;
+
+// Publish and get the operation hash immediately.
+let processing = tx.publish("Hello!".into()).await?;
+let hash = processing.hash();
+
+// Optionally await the full processing result.
+let result = processing.await?;
+assert!(result.is_completed());
+```
+
+### System event stream
+
+```rust
+use futures_util::StreamExt;
+
+let mut events = node.event_stream().await?;
+tokio::spawn(async move {
+    while let Some(event) = events.next().await {
+        println!("{:?}", event);
+    }
+});
+```
+
+## Feature flags
+
+All default features enable the full stack. Individual modules can be turned off when building smaller binaries.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `test_utils` | off | Enables test helpers on `Node` (e.g., `node.store()`). |
+
+<CardGroup cols={2}>
+  <Card title="p2panda-net" href="/crates/p2panda-net">
+    Networking, gossip, discovery, and sync orchestration layer.
+  </Card>
+  <Card title="p2panda-store" href="/crates/p2panda-store">
+    SQLite storage backend used by `NodeBuilder`.
+  </Card>
+  <Card title="p2panda-core" href="/crates/p2panda-core">
+    Core operation, header, and signing types re-exported here.
+  </Card>
+  <Card title="p2panda-stream" href="/crates/p2panda-stream">
+    Composable event processors that power the stream pipeline.
+  </Card>
+</CardGroup>

@@ -1,0 +1,152 @@
+---
+title: "p2panda-stream — composable event stream processors"
+description: "Interfaces and implementations for composing layered event processors over p2panda data streams, including log ingest, causal ordering, and pruning."
+---
+
+`p2panda-stream` provides the event-processing layer of the p2panda stack. It separates the question of _how_ events were delivered from _how_ they should be processed, making processing logic portable across any transport. Processors implement the `Processor<T>` trait: they consume items, apply internal logic (validation, ordering, pruning, access control), and asynchronously emit enriched output items — possibly in a different order or after holding them for a period while waiting for dependencies.
+
+## Installation
+
+```toml Cargo.toml
+[dependencies]
+p2panda-stream = "0.6.1"
+```
+
+## Key exports
+
+<AccordionGroup>
+  <Accordion title="Processor traits and composition">
+    | Export | Description |
+    |--------|-------------|
+    | `Processor<T>` | Core trait: `process(input)` and `next() -> Output`. Processors never terminate. |
+    | `Pipeline` | A composed, layered pipeline of processors run in sequence. |
+    | `PipelineBuilder` / `LayeredBuilder` | Builders for assembling multi-layer pipelines. |
+    | `ComposedProcessors` | Runs multiple independent processors over the same input stream. |
+    | `ProcessorStream` | Wraps a processor as a `futures::Stream`. |
+    | `ProcessorExt` / `StreamLayerExt` | Extension traits for chaining processor transformations onto streams. |
+  </Accordion>
+
+  <Accordion title="Built-in processor modules">
+    | Module | Feature flag | Description |
+    |--------|-------------|-------------|
+    | `ingest` | `ingest` | Validates log integrity and persists incoming `Operation`s into the store. |
+    | `orderer` | `orderer` | Causally orders concurrent operations from multiple writers. |
+    | `log_prune` | `log_prune` | Applies prune flags to garbage-collect old log entries. |
+  </Accordion>
+
+  <Accordion title="Ingest sub-exports">
+    | Export | Description |
+    |--------|-------------|
+    | `Ingest` | The ingestion processor: validates backlinks, sequence numbers, and signatures before persisting. |
+    | `IngestResult` | Outcome of processing a single operation (accepted, rejected, duplicate, etc.). |
+    | `IngestArgs` | Configuration arguments for the `Ingest` processor. |
+    | `IngestError` | Error type returned by `ingest_operation`. |
+    | `ingest_operation` | Low-level function to ingest a single operation without the processor abstraction. |
+  </Accordion>
+</AccordionGroup>
+
+## Processor trait
+
+```rust
+pub trait Processor<T> {
+    type Output;
+    type Error;
+
+    /// Consume an item for further processing. May apply back-pressure.
+    fn process(&self, input: T) -> impl Future<Output = Result<(), Self::Error>>;
+
+    /// Returns the next processed output whenever ready.
+    /// Stays in `Poll::Pending` when no work is available — processors never terminate.
+    fn next(&self) -> impl Future<Output = Result<Self::Output, Self::Error>>;
+}
+```
+
+<Note>
+Processors are single-threaded by design. They do not implement `Send` or `Sync`. Run processor code in a `tokio::task::LocalSet` or use the `tokio::task::spawn_local` executor.
+</Note>
+
+## Usage examples
+
+### Building a pipeline
+
+The `PipelineBuilder` API chains processors into a single ordered pipeline.
+
+```rust
+use p2panda_stream::Pipeline;
+
+// Construct a processing pipeline from store and task tracker.
+// (Concrete generic types depend on your Operation extension type.)
+let pipeline = Pipeline::new::<MyStore>(store.clone(), task_tracker);
+```
+
+### Using ProcessorExt on a stream
+
+```rust
+use futures_util::StreamExt;
+use p2panda_stream::{ProcessorExt, StreamLayerExt};
+
+// Attach a processor layer onto an existing stream.
+let processed = raw_stream.layer(my_processor);
+
+while let Some(output) = processed.next().await {
+    // Handle enriched output items.
+}
+```
+
+### Ingesting a single operation
+
+```rust
+use p2panda_stream::ingest::{IngestArgs, ingest_operation};
+
+let args = IngestArgs {
+    store: store.clone(),
+    // ... additional config fields
+};
+
+match ingest_operation(args, incoming_operation).await {
+    Ok(result) => println!("Accepted: {:?}", result),
+    Err(err) => eprintln!("Rejected: {}", err),
+}
+```
+
+## Architecture
+
+`p2panda-stream` cleanly separates the _event delivery_ layer from the _event processing_ layer. An operation received over gossip, sync, a USB stick, or LoRa radio is processed identically — the processor does not know or care about transport.
+
+```
+Transport (iroh, LoRa, BLE, etc.)
+        │
+        ▼
+   [Ingest layer]       ← validate log integrity, persist
+        │
+        ▼
+   [Orderer layer]      ← causal ordering / dependency resolution
+        │
+        ▼
+   [Prune layer]        ← apply prune flags, garbage collection
+        │
+        ▼
+   Application layer    ← domain-specific logic
+```
+
+Each layer emits output items for the next layer, may withhold items until dependencies are met, and operates over a single-threaded local executor.
+
+## Feature flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `ingest` | on | Enables the `ingest` module for log integrity validation and persistence. |
+| `orderer` | on | Enables the `orderer` module for causal ordering. |
+| `log_prune` | on | Enables the `log_prune` module for pruning outdated entries. |
+
+<CardGroup cols={2}>
+  <Card title="p2panda-core" href="/crates/p2panda-core">
+    Defines the `Operation` type consumed by all processors.
+  </Card>
+  <Card title="p2panda-store" href="/crates/p2panda-store">
+    Persistence backend used by the ingest and orderer processors.
+  </Card>
+  <Card title="p2panda" href="/crates/p2panda">
+    High-level Node API that assembles a `Pipeline` from these processors.
+  </Card>
+</CardGroup>

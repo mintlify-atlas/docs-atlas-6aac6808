@@ -1,0 +1,172 @@
+---
+title: "p2panda-discovery — PSI-based confidential discovery"
+description: "Private Set Intersection-based topic discovery and random-walk peer sampling, ensuring topic identifiers are never revealed to nodes that do not hold them."
+---
+
+`p2panda-discovery` provides the traits and default implementation for p2panda's confidential topic discovery protocol. Rather than broadcasting which topics a node is interested in, two nodes first prove mutual knowledge of a topic using a Private Set Intersection (PSI) / Private Equality Testing (PET) technique — only nodes that share a topic learn they share it. A random-walk peer-sampling strategy drives which nodes to contact, starting from locally configured bootstrap nodes and expanding outward through the network without any centralised registry.
+
+## Installation
+
+```toml Cargo.toml
+[dependencies]
+p2panda-discovery = "0.6.1"
+```
+
+## Key exports
+
+<AccordionGroup>
+  <Accordion title="Trait interfaces (traits module)">
+    | Trait / Type | Description |
+    |---|---|
+    | `DiscoveryStrategy<ID, N>` | Peer-sampling strategy. Implements `next_node(previous)` to select the next node to contact. |
+    | `DiscoveryProtocol<ID, N>` | Two-party protocol between initiator (Alice) and acceptor (Bob) for exchanging node info and topics. |
+    | `DiscoveryResult<ID, N>` | Result of a protocol exchange: remote node ID, transport infos, and shared topics discovered. |
+    | `LocalTopics` | Interface for querying which topics the local node is currently interested in. |
+  </Accordion>
+
+  <Accordion title="Random walk implementation (random_walk feature)">
+    | Type | Description |
+    |------|-------------|
+    | `RandomWalker<R, S, ID, N>` | Breadth-first random walk over the peer graph. Implements `DiscoveryStrategy`. |
+    | `RandomWalkerConfig` | Configuration for the random walk: `reset_walk_probability`. |
+  </Accordion>
+
+  <Accordion title="PSI hashing (psi_hash module)">
+    Helper functions for the Private Set Intersection hash operation used during topic exchange. Topics are salted and hashed so the actual topic bytes are never transmitted.
+  </Accordion>
+</AccordionGroup>
+
+## How discovery works
+
+```text
+Alice's topics: T1, T2, T3, T4
+Bob's topics:   T1, T4, T5
+
+After the confidential protocol exchange:
+- Alice learns Bob is interested in T1 and T4
+- Bob learns Alice is interested in T1 and T4
+- Neither party learns about the other's remaining topics
+```
+
+The protocol requires a direct, authenticated end-to-end encrypted connection — topic hashes are never placed into DHTs or other globally-distributed structures. Since every node can also share information about further nodes it knows, no rendezvous server or DNS-like lookup is needed.
+
+## Random walk algorithm
+
+The `RandomWalker` implements a breadth-first peer-sampling strategy:
+
+1. Start from a randomly selected bootstrap node.
+2. Run the discovery protocol with that node and receive its known neighbours.
+3. Sample a random unvisited node from the expanded set and repeat.
+4. Probabilistically reset (default 2%) to avoid getting stuck in cycles or isolated clusters.
+5. Reset automatically when all known nodes have been visited.
+
+```rust
+use p2panda_discovery::random_walk::{RandomWalker, RandomWalkerConfig};
+use p2panda_discovery::traits::DiscoveryStrategy;
+use rand_chacha::ChaCha20Rng;
+use rand::SeedableRng;
+
+let rng = ChaCha20Rng::from_seed([1; 32]);
+
+// Default config: 2% reset probability.
+let walker = RandomWalker::new(my_node_id, store.clone(), rng);
+
+// Custom config: never reset (useful for tests).
+let walker = RandomWalker::from_config(
+    my_node_id,
+    store.clone(),
+    rng,
+    RandomWalkerConfig {
+        reset_walk_probability: 0.0,
+    },
+);
+```
+
+## DiscoveryStrategy trait
+
+```rust
+pub trait DiscoveryStrategy<ID, N>
+where
+    N: NodeInfo<ID>,
+{
+    type Error;
+
+    /// Returns the next node to contact.
+    /// Pass `None` on the first call; pass the previous result on subsequent calls.
+    fn next_node(
+        &self,
+        previous: Option<&DiscoveryResult<ID, N>>,
+    ) -> impl Future<Output = Result<Option<ID>, Self::Error>>;
+}
+```
+
+## DiscoveryProtocol trait
+
+```rust
+pub trait DiscoveryProtocol<ID, N>
+where
+    N: NodeInfo<ID>,
+{
+    type Error;
+    type Message;
+
+    /// Run the protocol as the initiating party.
+    fn alice(
+        &self,
+        tx: &mut (impl Sink<Self::Message, Error = impl Debug> + Unpin),
+        rx: &mut (impl Stream<Item = Result<Self::Message, impl Debug>> + Unpin),
+    ) -> impl Future<Output = Result<DiscoveryResult<ID, N>, Self::Error>>;
+
+    /// Run the protocol as the accepting party.
+    fn bob(
+        &self,
+        tx: &mut (impl Sink<Self::Message, Error = impl Debug> + Unpin),
+        rx: &mut (impl Stream<Item = Result<Self::Message, impl Debug>> + Unpin),
+    ) -> impl Future<Output = Result<DiscoveryResult<ID, N>, Self::Error>>;
+}
+```
+
+## DiscoveryResult
+
+```rust
+pub struct DiscoveryResult<ID, N: NodeInfo<ID>> {
+    /// The remote node we exchanged with.
+    pub remote_node_id: ID,
+
+    /// Transport information learned during this exchange (may include
+    /// transitive info about other nodes the remote knows about).
+    pub transport_infos: BTreeMap<ID, N::Transports>,
+
+    /// Topics this node has proven interest in.
+    pub topics: HashSet<Topic>,
+}
+```
+
+## Security considerations
+
+<Note>
+Topics are cryptographically secure, randomly generated 32-byte values. An attacker cannot feasibly reverse the PSI hash to learn the underlying topic, even if the hash function is not purpose-built to resist brute force — the secret key space of a random 32-byte value is too large.
+</Note>
+
+<Warning>
+mDNS discovery is disabled by default in `p2panda-net` to avoid unintentionally leaking network membership information on local-area networks. Enable it explicitly only when local-area discovery is desired.
+</Warning>
+
+## Feature flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `random_walk` | on | Enables `RandomWalker` and `RandomWalkerConfig`. |
+| `test_utils` | off | Enables test helpers including mock node info types. |
+
+<CardGroup cols={2}>
+  <Card title="p2panda-net" href="/crates/p2panda-net">
+    `Discovery` in `p2panda-net` uses these traits and the random walk to drive confidential discovery.
+  </Card>
+  <Card title="p2panda-store" href="/crates/p2panda-store">
+    Address book store used by `RandomWalker` to persist and query known nodes.
+  </Card>
+  <Card title="p2panda-sync" href="/crates/p2panda-sync">
+    After discovery identifies peers with matching topics, sync sessions begin.
+  </Card>
+</CardGroup>

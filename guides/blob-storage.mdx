@@ -1,0 +1,141 @@
+---
+title: "Store and transfer large files with p2panda-blobs"
+description: "Use p2panda-blobs to import, export, and download content-addressed blobs over a p2panda network with in-memory or filesystem-based persistence."
+---
+
+`p2panda-blobs` provides a networked blob store for streaming content-addressed binary data between peers. Unlike p2panda's operation log — which is optimised for small, structured messages — the blobs crate is designed for arbitrary binary payloads: images, audio, video, documents, and any other large files your application needs to distribute. Blobs are identified by their BLAKE3 hash, so every piece of content has a globally unique, verifiable address with no naming collisions.
+
+## Add the dependency
+
+```toml
+[dependencies]
+p2panda-blobs = "0.6.1"
+```
+
+## Content-addressed storage
+
+Every blob is stored and retrieved by its `Hash` — the BLAKE3 digest of its raw bytes. This means:
+
+- Two identical files always produce the same hash, so storage is automatically deduplicated.
+- Any recipient can verify integrity by recomputing the hash after download — no separate signature step required.
+- You can reference blobs by hash inside your p2panda operation payloads to link structured data to binary content.
+
+```rust
+use p2panda_core::Hash;
+```
+
+## In-memory vs filesystem persistence
+
+`Blobs` is generic over the underlying `iroh_blobs::store::Store` implementation. Two options are provided by the `iroh-blobs` crate:
+
+<CodeGroup>
+
+```rust In-memory store
+use iroh_blobs::store::mem::Store as MemStore;
+
+let store = MemStore::new();
+```
+
+```rust Filesystem store
+use iroh_blobs::store::fs::Store as FsStore;
+use std::path::PathBuf;
+
+let store = FsStore::load(PathBuf::from("blobs_dir")).await?;
+```
+
+</CodeGroup>
+
+Use the in-memory store for tests and short-lived sessions. Use the filesystem store for production deployments where blobs must survive process restarts.
+
+## Setting up the Blobs service
+
+`Blobs` is constructed from a `NetworkBuilder` and a store. It registers the blobs ALPN protocol on the network endpoint and returns both the live `Network` handle and the `Blobs` service:
+
+```rust
+use p2panda_blobs::Blobs;
+
+let (network, blobs) = Blobs::from_builder(network_builder, store).await?;
+```
+
+## Importing a file
+
+To add a local file to the blob store, call `blobs.import_blob(path)`. This returns a stream of `ImportBlobEvent` values. Poll the stream until you receive `ImportBlobEvent::Done(hash)` to retrieve the content address of the stored blob.
+
+```rust
+use std::path::PathBuf;
+use futures_lite::StreamExt;
+use p2panda_blobs::ImportBlobEvent;
+
+let path = PathBuf::from("photo.jpg");
+let mut events = blobs.import_blob(path).await;
+
+while let Some(event) = events.next().await {
+    match event {
+        ImportBlobEvent::Done(hash) => {
+            println!("imported blob: {}", hash);
+        }
+        ImportBlobEvent::Abort(err) => {
+            eprintln!("import failed: {:?}", err);
+        }
+    }
+}
+```
+
+To import from an in-memory byte stream rather than a file path, use `import_blob_from_stream`:
+
+```rust
+use bytes::Bytes;
+use futures_util::stream;
+
+let data = stream::once(async { Ok::<_, std::io::Error>(Bytes::from("hello world")) });
+let mut events = blobs.import_blob_from_stream(data).await;
+```
+
+## Downloading blobs from peers
+
+Call `blobs.download_blob(hash)` to fetch a blob identified by its hash from any peer that holds it. The method returns a stream of `DownloadBlobEvent` values:
+
+```rust
+use p2panda_core::Hash;
+use p2panda_blobs::DownloadBlobEvent;
+use futures_lite::StreamExt;
+
+let hash: Hash = /* hash obtained from an operation payload */;
+let mut events = blobs.download_blob(hash).await;
+
+while let Some(event) = events.next().await {
+    match event {
+        DownloadBlobEvent::Done => println!("download complete"),
+        DownloadBlobEvent::Abort(err) => eprintln!("download failed: {:?}", err),
+    }
+}
+```
+
+The downloader queries all known peers for the blob and selects a source automatically. If no peer currently holds the blob the download will fail with an error.
+
+## Retrieving a stored blob
+
+To check whether a blob is already present in the local store and read its metadata, use `blobs.get(hash)`:
+
+```rust
+if let Some(entry) = blobs.get(hash).await? {
+    println!("blob is available locally, size: {}", entry.size());
+}
+```
+
+## Exporting a blob to the filesystem
+
+To write a stored blob out to a file path:
+
+```rust
+use std::path::PathBuf;
+
+let outpath = PathBuf::from("export/photo.jpg");
+blobs.export_blob(hash, &outpath).await?;
+```
+
+The export first writes the blob to a temporary file and then copies it into place once the export is complete, reducing the risk of partially-written files.
+
+<Note>
+`p2panda-blobs` is under active development and the API is not yet considered stable for production use. The crate is currently being refactored following a networking layer change. Core types and user-facing methods may undergo breaking changes before the v1.0.0 release.
+</Note>

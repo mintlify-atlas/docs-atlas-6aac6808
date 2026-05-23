@@ -1,0 +1,182 @@
+---
+title: "p2panda-sync — sync protocol traits and implementations"
+description: "Data-type-agnostic traits for two-party sync protocols and session managers, with built-in log sync and topic handshake protocol implementations."
+---
+
+`p2panda-sync` defines the abstract interfaces for building and orchestrating two-party sync protocols in p2panda. The `Protocol` trait describes a single sync session running over a `Sink`/`Stream` pair, while the `Manager` trait handles instantiating, tracking, and routing messages to concurrent sessions. Concrete implementations for syncing p2panda append-only logs over topics — including a confidential topic handshake — are provided in the `protocols` module. Most applications use `p2panda-net`'s `LogSync` which wraps these protocols, but this crate is available when a custom base convergent data type or sync strategy is needed.
+
+## Installation
+
+```toml Cargo.toml
+[dependencies]
+p2panda-sync = "0.6.1"
+```
+
+## Key exports
+
+<AccordionGroup>
+  <Accordion title="Top-level types">
+    | Export | Description |
+    |--------|-------------|
+    | `SessionConfig<T>` | Configuration for a single sync session: topic, remote node ID, and live-mode flag. |
+    | `ToSync<M>` | Message sent into a running sync session: `Payload(M)` or `Close`. |
+    | `FromSync<E>` | Event emitted from a manager: session ID, remote node ID, and typed event. |
+  </Accordion>
+
+  <Accordion title="Trait interfaces (traits module)">
+    | Trait | Description |
+    |-------|-------------|
+    | `Protocol` | Two-party sync session running over a sink/stream pair. Defines `run(sink, stream)`. |
+    | `Manager<T>` | Creates and manages concurrent `Protocol` sessions for a topic type `T`. |
+  </Accordion>
+
+  <Accordion title="Built-in protocols (protocols module)">
+    | Export | Description |
+    |--------|-------------|
+    | `LogSyncProtocol` | Syncs p2panda append-only log operations between two peers. |
+    | `TopicHandshake` | Confidential exchange of topic interest before committing to a full sync. |
+    | `TopicLogSync` | Combined topic handshake followed by log sync in one protocol. |
+  </Accordion>
+
+  <Accordion title="Manager implementations (manager module)">
+    | Export | Description |
+    |--------|-------------|
+    | `LogSyncManager` | Default manager that orchestrates concurrent `TopicLogSync` sessions. |
+  </Accordion>
+</AccordionGroup>
+
+## Protocol trait
+
+```rust
+pub trait Protocol {
+    type Output;
+    type Error: StdError + Send + Sync + 'static;
+    type Message: Serialize + for<'a> Deserialize<'a>;
+
+    fn run(
+        self,
+        sink: &mut (impl Sink<Self::Message, Error = impl Debug> + Unpin),
+        stream: &mut (impl Stream<Item = Result<Self::Message, impl Debug>> + Unpin),
+    ) -> impl Future<Output = Result<Self::Output, Self::Error>>;
+}
+```
+
+Implement this trait to define any custom two-party sync exchange. The `run` method is called once per session and may perform any sequence of message exchanges before returning.
+
+## Manager trait
+
+```rust
+pub trait Manager<T> {
+    type Protocol: Protocol + Send + 'static;
+    type Args: Clone + Send + 'static;
+    type Message: Clone + Send + 'static;
+    type Event: Clone + Debug + Send + 'static;
+    type Error: StdError + Send + Sync + 'static;
+
+    fn from_args(args: Self::Args) -> Self;
+
+    /// Instantiate a new sync session.
+    fn session(
+        &mut self,
+        session_id: u64,
+        config: &SessionConfig<T>,
+    ) -> impl Future<Output = Self::Protocol>;
+
+    /// Get a send handle to an existing session.
+    fn session_handle(
+        &self,
+        session_id: u64,
+    ) -> impl Future<Output = Option<Pin<Box<dyn Sink<ToSync<Self::Message>, Error = Self::Error>>>>>;
+
+    /// Subscribe to the manager event stream.
+    fn subscribe(
+        &mut self,
+    ) -> impl Stream<Item = FromSync<Self::Event>> + Send + Unpin + 'static;
+}
+```
+
+## Session configuration
+
+```rust
+use p2panda_sync::SessionConfig;
+use p2panda_core::VerifyingKey;
+
+let config = SessionConfig {
+    // The topic to sync (any T: TopicQuery + TopicId).
+    topic: my_topic,
+    // The remote peer's public key.
+    remote: remote_node_id,
+    // When true, the session remains open in "live mode" after initial sync
+    // and pushes new operations as they arrive.
+    live_mode: true,
+};
+```
+
+## Using built-in protocols
+
+### Topic log sync
+
+The `TopicLogSync` protocol first performs a confidential handshake to verify mutual topic interest, then synchronises all log operations for that topic.
+
+```rust
+use p2panda_sync::protocols::TopicLogSync;
+use p2panda_sync::traits::Protocol;
+
+// A TopicLogSync instance is created by the manager for each session.
+// Typically you won't construct it directly; instead use LogSyncManager
+// through p2panda-net's LogSync module.
+```
+
+### Consuming sync events from a manager
+
+```rust
+use futures_util::StreamExt;
+use p2panda_sync::traits::Manager;
+
+let mut events = manager.subscribe();
+
+tokio::spawn(async move {
+    while let Some(from_sync) = events.next().await {
+        println!(
+            "Session {} from {}: {:?}",
+            from_sync.session_id(),
+            from_sync.remote(),
+            from_sync.event(),
+        );
+    }
+});
+```
+
+### Sending data to a running session
+
+```rust
+use p2panda_sync::ToSync;
+
+if let Some(mut handle) = manager.session_handle(session_id).await {
+    handle.send(ToSync::Payload(my_message)).await?;
+    // Signal graceful close:
+    handle.send(ToSync::Close).await?;
+}
+```
+
+## Deduplication
+
+`p2panda-sync` includes internal deduplication logic to prevent the same operation from being applied more than once when sessions overlap or a node reconnects.
+
+## Feature flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `test_utils` | off | Enables in-memory mock sinks and streams for testing custom protocols. |
+
+<CardGroup cols={2}>
+  <Card title="p2panda-net" href="/crates/p2panda-net">
+    `LogSync` in `p2panda-net` wraps these protocols for high-level use.
+  </Card>
+  <Card title="p2panda-discovery" href="/crates/p2panda-discovery">
+    Topic discovery that identifies which nodes to initiate sync sessions with.
+  </Card>
+  <Card title="p2panda-core" href="/crates/p2panda-core">
+    Provides the `Operation` type that `LogSyncProtocol` exchanges.
+  </Card>
+</CardGroup>

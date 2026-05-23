@@ -1,0 +1,179 @@
+---
+title: "p2panda-core — cryptographic append-only log types"
+description: "Cryptographically-authenticated append-only log data types used across the p2panda stack: operations, headers, signing, hashing, and extensions."
+---
+
+`p2panda-core` defines the fundamental data structures that every other p2panda crate builds on. Its central type is a highly extensible, fork-tolerant, single-writer append-only log whose entries are called `Operation`s. An `Operation` combines a `Header` (metadata, sequence number, backlink, signature) with an optional `Body` (raw application bytes). Authors sign each header with an Ed25519 key pair, making every entry tamper-proof and attributable.
+
+## Installation
+
+```toml Cargo.toml
+[dependencies]
+p2panda-core = "0.6.1"
+```
+
+## Key exports
+
+<AccordionGroup>
+  <Accordion title="Core data types">
+    | Type | Description |
+    |------|-------------|
+    | `Operation<E>` | A signed log entry: `hash`, `header`, and optional `body`. Generic over extension type `E`. |
+    | `Header<E>` | All metadata for an operation: version, author key, signature, payload hash/size, timestamp, sequence number, backlink, and extensions. |
+    | `Body` | The raw application payload bytes. |
+    | `Hash` | BLAKE3 hash of header bytes. |
+    | `Cursor` | An opaque position marker within a log or stream. |
+    | `Topic` | 32-byte randomly generated identifier used to group related logs. |
+    | `Timestamp` | UNIX timestamp (seconds). |
+    | `LogId` | Identifies a specific log for an author. |
+    | `SeqNum` | Monotonically increasing sequence number within a log. |
+    | `SigningKey` | Ed25519 private key for signing operations. |
+    | `VerifyingKey` | Ed25519 public key / author identity. |
+    | `Signature` | Ed25519 signature over a serialised header. |
+  </Accordion>
+
+  <Accordion title="Extension types">
+    | Type | Description |
+    |------|-------------|
+    | `Extension<T>` | A single optional extension field that CBOR-serialises to `null` when absent. |
+    | `Extensions` | Trait marking a type as usable as the generic `E` in `Header<E>`. |
+    | `PruneFlag` | Extension field indicating a log entry that prunes older entries (`prune` feature required). |
+  </Accordion>
+
+  <Accordion title="Validation functions">
+    | Function | Description |
+    |----------|-------------|
+    | `validate_operation(op, prev)` | Validates a full operation including header integrity and log order. |
+    | `validate_backlink(header, prev_hash)` | Confirms the backlink field matches the previous operation's hash. |
+    | `validate_header(header)` | Validates signature and internal consistency of a header. |
+  </Accordion>
+</AccordionGroup>
+
+## Header struct fields
+
+```rust
+pub struct Header<E = ()> {
+    /// Format version (currently 1).
+    pub version: u64,
+    /// Author's public key.
+    pub verifying_key: VerifyingKey,
+    /// Ed25519 signature over the CBOR-encoded header (set after signing).
+    pub signature: Option<Signature>,
+    /// Byte length of the body payload.
+    pub payload_size: u64,
+    /// BLAKE3 hash of the body payload (None for header-only operations).
+    pub payload_hash: Option<Hash>,
+    /// UNIX timestamp when this operation was created.
+    pub timestamp: Timestamp,
+    /// Position of this entry in the author's log (0-indexed).
+    pub seq_num: SeqNum,
+    /// Hash of the immediately preceding operation in the same log.
+    pub backlink: Option<Hash>,
+    /// Application- or system-defined extension fields.
+    pub extensions: E,
+}
+```
+
+## Usage examples
+
+### Creating and signing an operation
+
+```rust
+use p2panda_core::{Body, Header, Operation, SigningKey, Timestamp};
+
+// Generate a new Ed25519 key pair. Store the signing key securely for reuse.
+let signing_key = SigningKey::generate();
+
+// Build the payload body.
+let body = Body::new("Hello, Sloth!".as_bytes());
+
+// Construct the header. seq_num 0 and no backlink means this is the first
+// entry in a new log.
+let mut header = Header {
+    version: 1,
+    verifying_key: signing_key.verifying_key(),
+    signature: None,
+    payload_size: body.size(),
+    payload_hash: Some(body.hash()),
+    timestamp: Timestamp::now(),
+    seq_num: 0,
+    backlink: None,
+    extensions: (),
+};
+
+// Sign the header in-place. The operation is now ready to be transmitted.
+header.sign(&signing_key);
+```
+
+### Appending to an existing log
+
+```rust
+use p2panda_core::{Body, Header, Hash, Operation, SigningKey, Timestamp};
+
+fn append(
+    signing_key: &SigningKey,
+    prev: &Operation<()>,
+    payload: &[u8],
+) -> Header<()> {
+    let body = Body::new(payload);
+    let mut header = Header {
+        version: 1,
+        verifying_key: signing_key.verifying_key(),
+        signature: None,
+        payload_size: body.size(),
+        payload_hash: Some(body.hash()),
+        timestamp: Timestamp::now(),
+        // Each new entry increments the sequence number.
+        seq_num: prev.header.seq_num + 1,
+        // Each entry points back to the hash of its predecessor.
+        backlink: Some(prev.hash),
+        extensions: (),
+    };
+    header.sign(signing_key);
+    header
+}
+```
+
+### Generating topics
+
+```rust
+use p2panda_core::Topic;
+
+// Randomly generated — share only with intended participants.
+let chat_room = Topic::random();
+
+// Deterministically derived from application data.
+let doc_topic = Topic::from(p2panda_core::Hash::digest(b"my-document-id"));
+```
+
+### Validating an incoming operation
+
+```rust
+use p2panda_core::{Operation, validate_operation};
+
+fn accept(op: &Operation<()>, prev: Option<&Operation<()>>) -> bool {
+    validate_operation(op, prev).is_ok()
+}
+```
+
+## Feature flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `prune` | on | Enables `PruneFlag` extension for garbage-collecting old log entries. |
+| `test_utils` | off | Exposes helper types and functions for unit tests. |
+
+<CardGroup cols={2}>
+  <Card title="p2panda" href="/crates/p2panda">
+    High-level Node API that re-exports the most commonly used types from this crate.
+  </Card>
+  <Card title="p2panda-store" href="/crates/p2panda-store">
+    SQLite persistence layer for storing and querying operations.
+  </Card>
+  <Card title="p2panda-stream" href="/crates/p2panda-stream">
+    Stream processors that work over `Operation` data types.
+  </Card>
+  <Card title="p2panda-sync" href="/crates/p2panda-sync">
+    Sync protocol traits that use `Operation` as the base convergent data type.
+  </Card>
+</CardGroup>

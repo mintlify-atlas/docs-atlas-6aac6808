@@ -1,0 +1,117 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "p2panda",
+  "projectDescription": "A modular Rust library suite for building privacy-respecting, local-first, offline-first peer-to-peer applications with built-in encryption, access control, and CRDT support.",
+  "theme": "palm",
+  "primaryColor": "#242b2c",
+  "lightColor": "#6a6a6d",
+  "darkColor": "#ebeaea",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "concepts"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/node-setup",
+              "guides/topic-streams",
+              "guides/publishing-data",
+              "guides/encryption",
+              "guides/access-control",
+              "guides/blob-storage"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/operations",
+              "architecture/sync",
+              "architecture/discovery",
+              "architecture/crdt-integration"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Crate Reference",
+        "groups": [
+          {
+            "group": "High-Level API",
+            "pages": [
+              "crates/p2panda",
+              "crates/p2panda-net"
+            ]
+          },
+          {
+            "group": "Core & Storage",
+            "pages": [
+              "crates/p2panda-core",
+              "crates/p2panda-store",
+              "crates/p2panda-stream"
+            ]
+          },
+          {
+            "group": "Security",
+            "pages": [
+              "crates/p2panda-encryption",
+              "crates/p2panda-auth"
+            ]
+          },
+          {
+            "group": "Networking",
+            "pages": [
+              "crates/p2panda-sync",
+              "crates/p2panda-discovery",
+              "crates/p2panda-blobs"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "High-level Node API with topic-based publish/subscribe streams",
+    "Local-first, offline-first data synchronisation over QUIC/iroh",
+    "Single-writer append-only CRDT operation logs with fork resistance",
+    "Decentralised group encryption with post-compromise security and forward secrecy",
+    "Fine-grained, per-member access control with DAG-based group management",
+    "Transport-agnostic design supporting Internet, BLE, LoRa, and packet radio",
+    "At-least-once event delivery with crash recovery and replay",
+    "Confidential topic and node discovery protocol",
+    "Large file (blob) transfer with content-addressing"
+  ],
+  "publicApiSurface": [
+    "p2panda::spawn()",
+    "p2panda::builder() -> NodeBuilder",
+    "Node::stream<M>(topic) -> (StreamPublisher<M>, StreamSubscription<M>)",
+    "Node::ephemeral_stream<M>(topic) -> (EphemeralStreamPublisher<M>, EphemeralStreamSubscription<M>)",
+    "Node::event_stream() -> Stream<SystemEvent>",
+    "Node::insert_bootstrap(node_id, relay_url)",
+    "NodeBuilder::signing_key(key)",
+    "NodeBuilder::database_url(url)",
+    "NodeBuilder::relay_url(url)",
+    "NodeBuilder::bootstrap(node_id, relay_url)",
+    "NodeBuilder::network_id(id)",
+    "NodeBuilder::ack_policy(policy)",
+    "StreamPublisher::publish(message)",
+    "Topic::random()",
+    "SigningKey::generate()",
+    "Header { version, verifying_key, signature, payload_size, payload_hash, timestamp, seq_num, backlink, extensions }",
+    "Body::new(bytes)",
+    "Operation",
+    "Hash",
+    "Cursor",
+    "p2panda_core::validate_operation()",
+    "p2panda_core::validate_backlink()",
+    "p2panda_core::validate_header()"
+  ]
+}

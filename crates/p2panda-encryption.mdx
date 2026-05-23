@@ -1,0 +1,150 @@
+---
+title: "p2panda-encryption — decentralised group encryption"
+description: "Two group encryption schemes for p2p apps: symmetric Data Encryption with post-compromise security and a forward-secret Message Encryption ratchet."
+---
+
+`p2panda-encryption` provides decentralised, secure group encryption for applications that cannot rely on a stable network or central coordination. It implements two complementary encryption schemes: **Data Encryption** for knowledge bases and collaborative documents where late-joining members should still read historic content, and **Message Encryption** for forward-secret group messaging similar to Signal's Double Ratchet algorithm. Both schemes offer post-compromise security (PCS) and work offline, requiring no online coordination for key agreement.
+
+## Installation
+
+```toml Cargo.toml
+[dependencies]
+p2panda-encryption = "0.6.1"
+
+# Enable specific schemes via feature flags:
+# p2panda-encryption = { version = "0.6.1", features = ["data_scheme", "message_scheme"] }
+```
+
+## Key exports
+
+<AccordionGroup>
+  <Accordion title="Core exports">
+    | Export | Description |
+    |--------|-------------|
+    | `Rng` | Cryptographically secure random number generator. |
+    | `RngError` | Error type for RNG operations. |
+  </Accordion>
+
+  <Accordion title="Key bundle types (key_bundle module)">
+    | Type | Description |
+    |------|-------------|
+    | `OneTimeKeyBundle` | X3DH key bundle for a single exchange: identity key, signed pre-key, optional one-time pre-key. |
+    | `LongTermKeyBundle` | Key bundle valid until the pre-key expires; no one-time pre-key. |
+    | `PreKey` | A signed X25519 Diffie-Hellman pre-key with an associated lifetime. |
+    | `OneTimePreKey` | A single-use X25519 pre-key identified by a `OneTimePreKeyId`. |
+    | `Lifetime` | A validity window (not-before / not-after timestamps) for pre-keys. |
+    | `latest_key_bundle(bundles)` | Selects the still-valid bundle with the furthest expiry date. |
+  </Accordion>
+
+  <Accordion title="Traits (traits module)">
+    | Trait | Description |
+    |-------|-------------|
+    | `KeyBundle` | Common interface for `OneTimeKeyBundle` and `LongTermKeyBundle`. |
+  </Accordion>
+
+  <Accordion title="Two-party key exchange (two_party module)">
+    Implements X3DH-based authenticated key exchange between exactly two parties, used as the foundation for both group schemes.
+  </Accordion>
+
+  <Accordion title="Key management">
+    | Type | Description |
+    |------|-------------|
+    | `key_manager` | Manages local key material: generation, rotation, and storage of pre-keys. |
+    | `key_registry` | A registry of remote parties' public key bundles used during key agreement. |
+  </Accordion>
+</AccordionGroup>
+
+## Encryption schemes
+
+### Data Encryption (`data_scheme` feature)
+
+Data Encryption uses a shared symmetric key (XChaCha20-Poly1305) for a group. All members with the current key can read all data encrypted under it, including historic content. When a member is removed, the key is rotated so the removed member cannot read newly-created content.
+
+**Best for:** Wiki applications, collaborative documents, booking tools, knowledge bases — anywhere late-joining members should access historic data.
+
+Properties:
+- Post-Compromise Security (PCS): rotation on member removal
+- Optional Forward Secrecy (FS): applications can delete old keys
+- Works fully offline with eventual key-agreement convergence
+
+### Message Encryption (`message_scheme` feature)
+
+Message Encryption implements a forward-secret messaging ratchet, similar to Signal's Double Ratchet algorithm. Each message is encrypted with a freshly derived key, so past messages cannot be decrypted even if a current key is compromised.
+
+**Best for:** Group chats, direct messaging — use cases requiring strong per-message forward secrecy.
+
+<Note>
+Strong forward secrecy introduces UX trade-offs. Message Encryption is best suited for specialised applications where per-message secrecy is explicitly required.
+</Note>
+
+## Key bundles and X3DH
+
+Before two parties can exchange encrypted data, they must perform a key agreement. `p2panda-encryption` implements X3DH (Extended Triple Diffie-Hellman) for initial key establishment.
+
+```rust
+use p2panda_encryption::key_bundle::{
+    OneTimeKeyBundle, LongTermKeyBundle, PreKey, OneTimePreKey, Lifetime,
+    latest_key_bundle,
+};
+use p2panda_encryption::crypto::{Rng, x25519::SecretKey, xeddsa::xeddsa_sign};
+use p2panda_encryption::traits::KeyBundle;
+
+let rng = Rng::from_seed([1; 32]);
+
+// Generate identity key pair.
+let identity_secret = SecretKey::from_bytes(rng.random_array().unwrap());
+let identity_key = identity_secret.verifying_key().unwrap();
+
+// Generate and sign a pre-key.
+let prekey_secret = SecretKey::from_bytes(rng.random_array().unwrap());
+let signed_prekey = PreKey::new(
+    prekey_secret.verifying_key().unwrap(),
+    Lifetime::default(),
+);
+let prekey_sig = xeddsa_sign(signed_prekey.as_bytes(), &identity_secret, &rng).unwrap();
+
+// Optionally attach a one-time pre-key for extra forward secrecy.
+let otpk_secret = SecretKey::from_bytes(rng.random_array().unwrap());
+let onetime_prekey = OneTimePreKey::new(otpk_secret.verifying_key().unwrap(), 1);
+
+let bundle = OneTimeKeyBundle::new(
+    identity_key,
+    signed_prekey,
+    prekey_sig,
+    Some(onetime_prekey),
+);
+
+// Verify the bundle before using it.
+bundle.verify()?;
+```
+
+### Key bundle lifetime
+
+Pre-keys are valid for a time window defined by `Lifetime`. The `latest_key_bundle` helper selects the currently-valid bundle with the furthest expiry from a set.
+
+```rust
+use p2panda_encryption::key_bundle::{latest_key_bundle, LongTermKeyBundle};
+use p2panda_encryption::traits::KeyBundle;
+
+let bundles: Vec<LongTermKeyBundle> = /* loaded from registry */;
+if let Some(best) = latest_key_bundle(&bundles) {
+    best.verify()?;
+}
+```
+
+## Feature flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `data_scheme` | off | Enables the symmetric group key agreement and encryption scheme. |
+| `message_scheme` | off | Enables the forward-secret message ratchet scheme. |
+| `test_utils` | off | Exposes helpers for testing encryption logic. |
+
+<CardGroup cols={2}>
+  <Card title="p2panda-auth" href="/crates/p2panda-auth">
+    Group membership and access control that pairs with encryption for secure collaboration.
+  </Card>
+  <Card title="p2panda-core" href="/crates/p2panda-core">
+    Provides `SigningKey` and `VerifyingKey` used as identity anchors in key bundles.
+  </Card>
+</CardGroup>

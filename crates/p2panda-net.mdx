@@ -1,0 +1,174 @@
+---
+title: "p2panda-net — modular peer-to-peer networking layer"
+description: "Peer-to-peer networking layer providing QUIC connections via iroh, gossip, confidential topic discovery, eventually-consistent log sync, and mDNS."
+---
+
+`p2panda-net` is the event-delivery layer of the p2panda stack. It ensures that application data eventually reaches all devices in the network, even after they have been offline, without requiring any central registry. The library is built around a broadcast topology — nodes publish to topics and subscribe to receive from them — making it portable across Internet-based transports today and future mesh transports such as LoRa or BLE.
+
+## Installation
+
+```toml Cargo.toml
+[dependencies]
+p2panda-net = "0.6.1"
+```
+
+## Key exports
+
+<AccordionGroup>
+  <Accordion title="Core types">
+    | Type | Description |
+    |------|-------------|
+    | `NodeId` | A node's unique identifier, derived from its Ed25519 public key (`VerifyingKey`). |
+    | `NetworkId` | A 32-byte array that partitions distinct networks and prevents cross-network communication. |
+    | `ProtocolId` | A `Vec<u8>` identifying a registered network protocol. |
+    | `DEFAULT_NETWORK_ID` | The built-in network ID (BLAKE3 of `"p2panda"`). |
+  </Accordion>
+
+  <Accordion title="Network modules (feature-gated)">
+    | Export | Feature flag | Description |
+    |--------|-------------|-------------|
+    | `Endpoint` | `iroh_endpoint` | QUIC/TLS 1.3 endpoint for direct Internet connections via iroh. |
+    | `AddressBook` | `address_book` | Local, persisted registry of nodes and their transport addresses. |
+    | `Discovery` | `discovery` | Confidential topic discovery using Private Set Intersection. |
+    | `MdnsDiscovery` | `iroh_mdns` | Local-area mDNS discovery for finding nearby nodes. |
+    | `Gossip` | `gossip` | Epidemic broadcast for ephemeral messages. |
+    | `LogSync` | `sync` | Eventually-consistent sync over p2panda append-only logs. |
+    | `Supervisor` | `supervisor` | Erlang-inspired actor supervisor that restarts failing modules. |
+  </Accordion>
+</AccordionGroup>
+
+## Usage example
+
+The following example shows how to compose individual modules to build a minimal peer-to-peer application.
+
+```rust
+use futures_util::StreamExt;
+use p2panda_core::Hash;
+use p2panda_net::iroh_mdns::MdnsDiscoveryMode;
+use p2panda_net::{AddressBook, Discovery, Endpoint, MdnsDiscovery, Gossip};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Topics are used to discover other nodes and exchange data around them.
+    let topic = Hash::digest(b"shirokuma-cafe").into();
+
+    // Maintain an address book of discovered and manually configured nodes.
+    let address_book = AddressBook::builder().spawn().await?;
+
+    // Establish direct QUIC connections via iroh.
+    let endpoint = Endpoint::builder(address_book.clone())
+        .spawn()
+        .await?;
+
+    // Discover nodes on the local-area network via mDNS.
+    let mdns = MdnsDiscovery::builder(address_book.clone(), endpoint.clone())
+        .mode(MdnsDiscoveryMode::Active)
+        .spawn()
+        .await?;
+
+    // Confidentially discover remote nodes that share the same topics.
+    let discovery = Discovery::builder(address_book.clone(), endpoint.clone())
+        .spawn()
+        .await?;
+
+    // Broadcast ephemeral messages across all online subscribers.
+    let gossip = Gossip::builder(address_book.clone(), endpoint.clone())
+        .spawn()
+        .await?;
+
+    // Subscribe to a topic stream.
+    let cafe = gossip.stream(topic).await?;
+    cafe.publish(b"Hello, Panda!").await?;
+
+    let mut rx = cafe.subscribe();
+    tokio::spawn(async move {
+        while let Some(Ok(bytes)) = rx.next().await {
+            println!("{}", String::from_utf8(bytes).unwrap());
+        }
+    });
+
+    Ok(())
+}
+```
+
+## Module overview
+
+<AccordionGroup>
+  <Accordion title="Endpoint — direct Internet connections">
+    `Endpoint` wraps iroh's QUIC implementation. It handles TLS 1.3 transport encryption, QUIC Address Discovery (STUN), hole-punching, and relayed fallback (TURN) when direct connections cannot be established.
+
+    Relay servers serve three purposes:
+    1. Route encrypted traffic while direct connection negotiation is in progress.
+    2. Assist with address discovery and hole-punching (STUN).
+    3. Provide relayed fallback when direct paths are unavailable (TURN).
+  </Accordion>
+
+  <Accordion title="Discovery — confidential topic exchange">
+    `Discovery` runs a random-walk peer-sampling strategy combined with a Private Set Intersection (PSI) protocol. Two nodes only learn they share a topic if both possess the same topic value — topic identifiers are never revealed to nodes that do not hold them.
+
+    The random walk begins from locally configured bootstrap nodes and traverses the network in a breadth-first manner, periodically resetting to avoid getting stuck in cycles.
+  </Accordion>
+
+  <Accordion title="Gossip — ephemeral pub/sub">
+    `Gossip` provides an epidemic broadcast protocol for messages that do not need to be stored. Useful for cursor positions, awareness/presence status, or other transient signals. Only currently-online nodes will receive gossip messages.
+  </Accordion>
+
+  <Accordion title="LogSync — eventually-consistent sync">
+    `LogSync` is the default sync module built on p2panda's append-only log data type. After initial sync finishes, nodes switch to live mode and push new operations via gossip. State vectors are exchanged in constant size, making `LogSync` bandwidth-efficient even over broadcast-oriented radio links.
+  </Accordion>
+
+  <Accordion title="AddressBook — node registry">
+    `AddressBook` persists known nodes and their transport information. It monitors connectivity changes, detects stale nodes, and identifies network partitions that can be automatically healed. Use it to register bootstrap nodes before spawning other modules.
+  </Accordion>
+
+  <Accordion title="Supervisor — failure-resilient actors">
+    All modules are implemented as actors. The optional `Supervisor` monitors them and automatically restarts any that crash, drawing inspiration from Erlang's supervision tree model.
+  </Accordion>
+</AccordionGroup>
+
+## Network identifiers
+
+```rust
+use p2panda_net::{NetworkId, DEFAULT_NETWORK_ID};
+
+// Use the built-in default — all p2panda nodes share this by default.
+let id: NetworkId = DEFAULT_NETWORK_ID;
+
+// Use a custom identifier to create an isolated network.
+let my_network: NetworkId = p2panda_core::Hash::digest(b"my-app-v1")
+    .as_bytes()
+    .try_into()
+    .unwrap();
+```
+
+<Warning>
+The network identifier is not exchanged confidentially between peers. Do not treat it as a secret value. See [issue #965](https://github.com/p2panda/p2panda/issues/965) for planned improvements.
+</Warning>
+
+## Feature flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `address_book` | on | Enables `AddressBook`. |
+| `discovery` | on | Enables `Discovery` (PSI-based confidential topic discovery). |
+| `gossip` | on | Enables `Gossip` ephemeral broadcast. |
+| `iroh_endpoint` | on | Enables `Endpoint` (iroh QUIC). |
+| `iroh_mdns` | on | Enables `MdnsDiscovery`. |
+| `sync` | on | Enables `LogSync`. |
+| `supervisor` | off | Enables `Supervisor` for actor restart on failure. |
+| `test_utils` | off | Testing helpers. |
+
+<CardGroup cols={2}>
+  <Card title="p2panda-discovery" href="/crates/p2panda-discovery">
+    Traits and implementation details for the PSI discovery protocol.
+  </Card>
+  <Card title="p2panda-sync" href="/crates/p2panda-sync">
+    Protocol and manager traits for implementing custom sync strategies.
+  </Card>
+  <Card title="p2panda" href="/crates/p2panda">
+    High-level Node API built on top of this crate.
+  </Card>
+  <Card title="p2panda-store" href="/crates/p2panda-store">
+    Address book and operation storage used by network modules.
+  </Card>
+</CardGroup>

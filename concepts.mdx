@@ -1,0 +1,200 @@
+---
+title: "Core concepts in p2panda"
+description: "A conceptual tour of operations, topics, the local-first model, and the Node API — the building blocks of every p2panda application."
+---
+
+p2panda is built around a small set of composable primitives. Understanding them makes it much easier to reason about how data flows through your application, how peers discover each other, and why the system remains consistent even when devices go offline. This page introduces each primitive and explains how they relate to one another.
+
+## Operations
+
+Every piece of data in p2panda travels as an `Operation`. An operation consists of two parts:
+
+- **`Header`** — metadata including the author's public key, a sequence number, a backlink to the previous operation, a BLAKE3 payload hash, a timestamp, and optional extensions.
+- **`Body`** — arbitrary application bytes (up to the application to decide the format).
+
+Operations are signed with **Ed25519** key pairs, encoded in **CBOR**, and hashed with **BLAKE3**. The header is enough to verify authorship and log integrity without the body, which means payloads can be loaded lazily or deleted without breaking the chain.
+
+Each author maintains one or more **single-writer append-only logs**. Every operation points back to the previous one via a `backlink` hash, forming a cryptographically linked list. This makes forks detectable and the log tamper-proof.
+
+```rust
+use p2panda_core::{Body, Header, Operation, SigningKey, Timestamp};
+
+// Generate an Ed25519 signing key for this author.
+let signing_key = SigningKey::generate();
+
+// The body carries arbitrary application bytes.
+let body = Body::new("Hello, Sloth!".as_bytes());
+
+// Build the header with full metadata.
+let mut header = Header {
+    version: 1,
+    verifying_key: signing_key.verifying_key(),
+    signature: None,
+    payload_size: body.size(),
+    payload_hash: Some(body.hash()),
+    timestamp: Timestamp::now(),
+    seq_num: 0,
+    backlink: None,   // first operation in the log has no backlink
+    extensions: (),
+};
+
+// Sign the header. The operation is now ready to transmit.
+header.sign(&signing_key);
+```
+
+Multiple authors' logs can be combined into **multi-writer streams** over a shared topic. The Node API handles causal ordering across authors automatically.
+
+## Topics
+
+A `Topic` is a fixed-length byte array that identifies a shared data space. Topics follow a **Publish & Subscribe** (PubSub) model: any node that publishes or subscribes to a topic will discover other nodes interested in the same topic and sync with them automatically.
+
+```rust
+use p2panda::Topic;
+
+// Generate a random topic for a new chat room or document.
+let topic = Topic::random();
+
+// Topics can be serialised and shared so other nodes can join.
+println!("{}", topic);  // e.g. "3f7a2c..."
+```
+
+Topics support **partial replication** — a node only stores and syncs the data it has subscribed to, not the entire network. This keeps storage and bandwidth proportional to what your application actually uses.
+
+A topic might represent a single document, a chess game session, a chat room, or any other bounded data space. The choice of what a topic maps to in your domain is entirely up to the application.
+
+## Local-first model
+
+p2panda is designed so that **data is always written locally first**. Publishing a message appends a new signed operation to the local log, persists it in a local SQLite database, and then forwards it to the networking layer. If no peers are currently reachable, the operation is stored and will be gossiped automatically the next time the node is online.
+
+Subscribing to a topic creates a **stateful stream consumer**. The node tracks which operations the application has acknowledged and will replay any unacknowledged operations on the next startup. This gives **at-least-once delivery** semantics, ensuring no message is lost even if the application crashes mid-processing.
+
+```rust
+use p2panda::node::AckPolicy;
+
+// Acknowledgement policies control when operations are marked as processed.
+//
+// Automatic (default): the node acknowledges each event immediately on delivery.
+// Explicit: the application must acknowledge events after its own processing succeeds.
+let policy = AckPolicy::Automatic;  // or AckPolicy::Explicit
+```
+
+With `AckPolicy::Explicit` your application can acknowledge an operation only after it has safely written derived state to its own database. Unacknowledged operations are replayed on restart, giving you crash-resilient processing without any additional infrastructure.
+
+Internally, the pipeline processes and acknowledges operations inside **atomic SQLite transactions**, minimising the risk of partial state after an unexpected shutdown.
+
+## The Node API
+
+The `Node` struct is the single entry point that orchestrates every layer of the stack:
+
+- **Networking** — QUIC-based transport via [iroh](https://iroh.computer) with mDNS discovery on the LAN and relay-assisted connectivity over the Internet.
+- **Discovery** — a random-walk protocol that finds peers interested in the same topics without a centralised registry.
+- **Sync** — efficient append-only log sync; state vectors are exchanged in constant size and only missing operations are transferred.
+- **Event streaming** — a processing pipeline that validates log integrity, applies pruning rules, performs causal ordering, and delivers operations to the application layer.
+- **Storage** — a local SQLite database that persists operations, sync state, address books, stream cursors, and acknowledgement state.
+
+```rust
+// Spawn with defaults: in-memory SQLite, mDNS discovery, no relay.
+let node = p2panda::spawn().await?;
+
+// Or use the builder for persistent storage and Internet connectivity.
+let node = p2panda::builder()
+    .database_url("my-app.sqlite")
+    .bootstrap(bootstrap_node_id, relay_url.clone())
+    .relay_url(relay_url)
+    .spawn()
+    .await?;
+```
+
+`node.stream::<M>(topic)` returns a typed `(StreamPublisher<M>, StreamSubscription<M>)` pair. The stream emits `StreamEvent` variants covering the full lifecycle of an operation:
+
+```rust
+use p2panda::streams::StreamEvent;
+use futures_util::StreamExt;
+
+while let Some(event) = rx.next().await {
+    match event {
+        // A fully processed application message from any source.
+        StreamEvent::Processed { operation, .. } => {
+            println!("message from {}: {:?}", operation.author(), operation.message());
+        }
+
+        // A sync session started with a remote peer.
+        StreamEvent::SyncStarted { remote_node_id, incoming_bytes, .. } => {
+            println!("syncing {} bytes from {}", incoming_bytes, remote_node_id);
+        }
+
+        // A sync session ended.
+        StreamEvent::SyncEnded { remote_node_id, .. } => {
+            println!("sync complete with {}", remote_node_id);
+        }
+
+        // System-level processing failure — log and continue.
+        StreamEvent::ProcessingFailed { error, .. } => {
+            eprintln!("processing error: {}", error);
+        }
+
+        _ => {}
+    }
+}
+```
+
+## Extensions
+
+The `Header` type accepts a generic `extensions` field. Extensions let you attach custom metadata to every operation without breaking the core log structure. p2panda ships built-in extensions for common patterns:
+
+- **`PruneFlag`** — marks an operation as a pruning point, instructing the node to discard older operations in the log to save storage.
+- **Tombstones** — explicit deletion markers for CRDT remove semantics.
+- **Causal ordering** — dependency metadata used by the multi-writer stream processor.
+
+You can also define your own extensions for application-specific features such as per-operation encryption metadata, capability tokens, or schema version tags.
+
+```rust
+use p2panda_core::{Body, Extension, Header, PruneFlag, SigningKey, Timestamp};
+use serde::{Deserialize, Serialize};
+
+let signing_key = SigningKey::generate();
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct MyExtensions {
+    prune_flag: PruneFlag,
+}
+
+impl Extension<PruneFlag> for MyExtensions {
+    fn extract(header: &Header<Self>) -> Option<PruneFlag> {
+        Some(header.extensions.prune_flag.clone())
+    }
+}
+
+let extensions = MyExtensions {
+    prune_flag: PruneFlag::new(true),
+};
+
+let body = Body::new("Prune from here please!".as_bytes());
+let mut header = Header {
+    version: 1,
+    verifying_key: signing_key.verifying_key(),
+    signature: None,
+    payload_size: body.size(),
+    payload_hash: Some(body.hash()),
+    timestamp: Timestamp::now(),
+    seq_num: 0,
+    backlink: None,
+    extensions,
+};
+header.sign(&signing_key);
+```
+
+<CardGroup cols={2}>
+  <Card title="Operations in depth" icon="link" href="/architecture/operations">
+    Log structure, backlinks, pruning, and fork detection explained in detail
+  </Card>
+  <Card title="Sync protocol" icon="arrows-rotate" href="/architecture/sync">
+    How state vectors enable bandwidth-efficient eventually consistent sync
+  </Card>
+  <Card title="Discovery protocol" icon="magnifying-glass" href="/architecture/discovery">
+    Random-walk peer discovery without centralised coordination
+  </Card>
+  <Card title="CRDT integration" icon="diagram-project" href="/architecture/crdt-integration">
+    Patterns for building LWW, 2P-Set, and other CRDTs on top of operation logs
+  </Card>
+</CardGroup>

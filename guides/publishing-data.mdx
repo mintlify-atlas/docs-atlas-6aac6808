@@ -1,0 +1,141 @@
+---
+title: "Publish data and handle processing results"
+description: "Publish typed messages with tx.publish(), await processing results, check hashes and status, and define custom serde message types for topic streams."
+---
+
+Publishing data in p2panda is as simple as calling `tx.publish(message)` on the `StreamPublisher` returned by `node.stream()`. Under the hood, the library creates a signed append-only log operation carrying your message as a CBOR-encoded payload, persists it locally, and forwards it to any currently connected peers. This guide covers how to define message types, publish them, await the processing result, and understand the local-first guarantee that underpins everything.
+
+## Defining a message type
+
+Any Rust type that implements `serde::Serialize` and `serde::Deserialize` can be used as a message. The library automatically serialises values to CBOR before embedding them in an operation.
+
+```rust
+use serde::{Serialize, Deserialize};
+
+// This will automatically serialise to CBOR.
+#[derive(Serialize, Deserialize)]
+enum CalendarMessage {
+    Update { title: String },
+    Delete,
+}
+```
+
+Enums, structs, and any composition thereof are supported. The type you provide as the generic parameter to `node.stream::<M>()` determines what `StreamEvent::Processed { operation, .. }` exposes through `operation.message()`.
+
+## Creating a stream and publishing
+
+Pass the message type as the generic parameter when creating the stream:
+
+```rust
+use p2panda::Topic;
+
+let node = p2panda::spawn().await?;
+let topic = Topic::random();
+let (tx, rx) = node.stream::<CalendarMessage>(topic).await?;
+```
+
+Publish by calling `tx.publish(message)`. The call returns a `PublishFuture` — a lightweight future you can either drop or `await` depending on whether you need to know when processing completed.
+
+```rust
+// Fire and forget — the operation is created and queued immediately.
+tx.publish(CalendarMessage::Update { title: "Team standup".into() }).await?;
+```
+
+## Awaiting the processing result
+
+`tx.publish()` returns `Result<PublishFuture, PublishError>`. You can inspect the hash of the created operation straight away, before processing has finished, by calling `.hash()` on the future. To wait for the processor to finish, simply `await` the future:
+
+```rust
+let node = p2panda::builder().spawn().await?;
+
+let (tx, _) = node.stream::<String>(topic).await?;
+
+// Publish a message — internally this creates an "operation" which needs to be processed.
+let processing = tx.publish("I'm being processed soon!".into()).await?;
+
+// The hash of the created operation is directly available.
+let hash = processing.hash();
+
+// We can optionally await the result of the processor.
+let result = processing.await?;
+assert!(result.is_completed());
+assert!(!result.is_failed());
+```
+
+The `Event` returned from `await` exposes `.is_completed()` and `.is_failed()` for quick status checks, as well as `.hash()` to confirm the operation identity.
+
+## Richer message types
+
+The todo list example in the p2panda repository demonstrates how to model a full event-sourced application. The message enum captures every possible change to the shared state:
+
+```rust
+use p2panda_core::Hash;
+use serde::{Deserialize, Serialize};
+
+type TodoItemId = Hash;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TodoEvent {
+    id: TodoItemId,
+    kind: TodoEventKind,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum TodoEventKind {
+    /// Sets the description of a todo list item.
+    Set { description: String },
+
+    /// Tombstones the item for "remove-wins" CRDT semantics.
+    Delete,
+}
+```
+
+Publishing and processing use the same stream, whether the event was created locally or arrived from a remote peer:
+
+```rust
+// Publish a locally created event.
+tx.publish(event).await?;
+```
+
+```rust
+// Process all events — local and remote — through the same handler.
+if let StreamEvent::Processed { operation, .. } = event {
+    todo_list.process(operation.message(), operation.timestamp().into());
+}
+```
+
+## Pruning a log
+
+To delete all previously published messages for a topic and signal other nodes to remove them too, call `tx.prune()`. You can optionally include a snapshot message so peers can still reconstruct the latest state without replaying the full history:
+
+```rust
+// Prune without a snapshot.
+tx.prune(None).await?;
+
+// Prune and publish a snapshot of current state.
+tx.prune(Some(snapshot_message)).await?;
+```
+
+## Local-first guarantee
+
+Publishing a message always succeeds locally regardless of whether any peers are reachable. The operation is signed, appended to the local log, and persisted immediately. Propagation to other nodes happens:
+
+- **Eagerly** — if a live sync session is active with another node, the operation is forwarded in real time.
+- **Lazily** — if no peers are currently connected, missed operations are synchronised automatically the next time nodes come online and discover each other.
+
+<Tip>
+Because operations are persisted locally before any network round-trip, your application can continue working entirely offline. When connectivity is restored, p2panda's sync protocol ensures all nodes converge to the same state without any manual intervention.
+</Tip>
+
+## Importing from external sources
+
+Operations can be imported from external sources — for instance a file exported from another node — via `tx.import(stream)`. The import is processed through the same pipeline as live sync data:
+
+```rust
+let external_stream_future = tx.import(operation_stream).await?;
+
+// Optionally await completion of the import.
+external_stream_future.await;
+```
+
+`ImportStarted` and `ImportEnded` `StreamEvent` variants are emitted on the subscription side so your application can track import progress.

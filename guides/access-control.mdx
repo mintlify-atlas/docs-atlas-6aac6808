@@ -1,0 +1,142 @@
+---
+title: "Manage groups and permissions with p2panda-auth"
+description: "Use p2panda-auth to create decentralised groups, assign Pull/Read/Write/Manage access levels, resolve concurrent operations, and plug in custom resolvers."
+---
+
+`p2panda-auth` provides decentralised, offline-first group management with fine-grained per-member permissions. Groups are represented as Directed Acyclic Graphs (DAGs) of signed operations, allowing members to be added, removed, promoted, and demoted even when they are offline or acting concurrently. Conflicting operations are automatically resolved so that all peers eventually reach the same group state without any central coordinator.
+
+## Add the dependency
+
+```toml
+[dependencies]
+p2panda-auth = "0.6.1"
+```
+
+## Access levels
+
+Every group member is assigned one of four access levels. Each level is a strict superset of those below it:
+
+<CardGroup cols={2}>
+
+<Card title="Pull" icon="arrow-down">
+Permission to sync a dataset from peers. The lowest access level — a member can replicate data but not read or modify it.
+</Card>
+
+<Card title="Read" icon="eye">
+Permission to read a dataset. Implies `Pull`. Useful for observers who should see content but not contribute.
+</Card>
+
+<Card title="Write" icon="pencil">
+Permission to write to a dataset. Implies `Read` and `Pull`. The standard level for active contributors.
+</Card>
+
+<Card title="Manage" icon="shield">
+Permission to modify group membership — add, remove, promote, or demote other members. Implies all lower levels. Only `Manage`-level members can author group operations.
+</Card>
+
+</CardGroup>
+
+```rust
+use p2panda_auth::{Access, AccessLevel};
+
+let read_access  = Access::read();
+let write_access = Access::write();
+let manage_access = Access::manage();
+```
+
+### Access conditions
+
+Each access level can carry application-defined conditions that further constrain what the level permits. For example, a `Read` condition might restrict access to a path prefix within a dataset:
+
+```rust
+use p2panda_auth::Access;
+
+// Grant Read access scoped to a specific path.
+let scoped_read = Access::read().with_conditions("/public");
+```
+
+Access comparisons follow the rule that a broader condition (shorter path prefix) grants at least as much access as a narrower one. Your condition type must implement `PartialOrd` to participate in access comparisons.
+
+## Group operations
+
+Group state is modified by publishing `GroupAction` values. The available actions are:
+
+```rust
+use p2panda_auth::group::GroupAction;
+
+// Create a group with initial members.
+GroupAction::Create { initial_members }
+
+// Add a new member.
+GroupAction::Add { member, access }
+
+// Remove a member entirely.
+GroupAction::Remove { member }
+
+// Raise a member's access level.
+GroupAction::Promote { member, access }
+
+// Lower a member's access level.
+GroupAction::Demote { member, access }
+```
+
+Every operation is signed by the author. Only operations authored by members with `Manage` access are applied to the group state — operations by lower-level members are silently discarded.
+
+## DAG structure
+
+All operations that comprise a group form a Directed Acyclic Graph. Each operation includes:
+
+- **`previous`** — references to causally preceding operations, enabling causal ordering.
+- **`dependencies`** — optional references that allow applications to express relationships between groups and their operations.
+
+The DAG structure lets operations be published concurrently and still be merged deterministically. Nodes that receive operations out of order will converge to the same group state once all operations have been delivered.
+
+## Concurrency resolution
+
+When group membership changes happen concurrently, conflicts can arise that the DAG alone cannot resolve. `p2panda-auth` walks the DAG in a depth-first search, identifies "bubbles" of concurrent operations, and applies resolution rules to determine which operations should be invalidated.
+
+The built-in **strong removal** resolver follows these rules:
+
+<AccordionGroup>
+
+<Accordion title="Rule 1: Demotion or removal invalidates concurrent actions">
+If a manager is removed or demoted concurrently with their own actions, those concurrent actions are invalidated. This prevents a just-removed manager from unilaterally modifying group state in the same causal window.
+</Accordion>
+
+<Accordion title="Rule 2: Mutual removals are both applied">
+If two managers remove or demote each other concurrently, both removals are applied — neither is invalidated. However, any other concurrent actions by those managers are still invalidated.
+</Accordion>
+
+<Accordion title="Rule 3: Re-adds are allowed">
+If Alice removes Charlie and later re-adds them, Charlie is still a member after the re-add. All of Charlie's actions that were concurrent with the removal remain invalidated.
+</Accordion>
+
+<Accordion title="Rule 4: Transitive invalidation">
+Invalidating an operation also invalidates every operation that causally depends on it. This cascades through the DAG until the dependency chain is exhausted.
+</Accordion>
+
+</AccordionGroup>
+
+## Custom resolvers
+
+The default strong removal behaviour can be replaced with any alternative approach by implementing the `Resolver` trait:
+
+```rust
+use p2panda_auth::traits::Resolver;
+```
+
+This allows you to plug in domain-specific concurrency semantics — for example a "last-writer-wins" policy or a consensus mechanism that fits your application's trust model.
+
+## How access levels interact with sync
+
+The access levels defined by `p2panda-auth` are designed to work alongside custom sync protocols. A sync layer can consult group membership and access levels to decide:
+
+- **Who to sync with** — only share data with members who have at least `Pull` access.
+- **What to sync** — restrict data exchange to the subset of data a member is permitted to access, using path-based or other conditions attached to their access level.
+- **Write validation** — reject incoming operations from peers who do not have `Write` access.
+
+This makes `p2panda-auth` a composable building block rather than a monolithic access control system: you wire it into your sync protocol, operation validator, and application logic as appropriate for your use case.
+
+<Note>
+`p2panda-auth` is under active development and APIs are not yet considered stable for production use. Breaking changes may occur before the v1.0.0 release.
+</Note>

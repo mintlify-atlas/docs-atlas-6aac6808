@@ -1,0 +1,162 @@
+---
+title: "p2panda-auth — decentralised group management"
+description: "Eventually-consistent group management with Pull/Read/Write/Manage permissions, DAG-based operation ordering, and a pluggable Resolver for concurrency."
+---
+
+`p2panda-auth` provides decentralised group management with fine-grained, per-member permissions. Groups are modified by publishing signed operations that form a Directed Acyclic Graph (DAG), allowing concurrent operations to be authored offline and later merged. The system resolves conflicting states automatically using a pluggable `Resolver` trait. Four access levels — `Pull`, `Read`, `Write`, and `Manage` — each act as a superset of the levels below them, and optional conditions allow domain-specific access boundaries such as path-based scoping.
+
+## Installation
+
+```toml Cargo.toml
+[dependencies]
+p2panda-auth = "0.6.1"
+```
+
+## Key exports
+
+<AccordionGroup>
+  <Accordion title="Core types">
+    | Export | Description |
+    |--------|-------------|
+    | `Access<C>` | An access level with optional conditions. Generic over condition type `C`. |
+    | `AccessLevel` | Enum: `Pull`, `Read`, `Write`, `Manage`. |
+    | `AccessError` | Parse error for `Access::from_str`. |
+  </Accordion>
+
+  <Accordion title="Group module">
+    | Export | Description |
+    |--------|-------------|
+    | `graph` | DAG data structure representing all group operations. |
+    | `group` | Group state management: add, remove, promote, and demote members. |
+  </Accordion>
+
+  <Accordion title="Traits">
+    | Trait | Description |
+    |-------|-------------|
+    | `Resolver<ID, OP, M, C>` | Custom concurrency resolution strategy. Implement to replace the default "strong removal" approach. |
+    | `IdentityHandle` | Abstraction over node identity types. |
+    | `OperationId` | Abstraction over operation identifier types. |
+    | `Conditions` | Marker trait for condition types attached to `Access`. |
+  </Accordion>
+
+  <Accordion title="Processor module (processor feature)">
+    Provides a stream processor that applies group operations as they arrive, updating group state in real time.
+  </Accordion>
+</AccordionGroup>
+
+## Access levels
+
+Access levels form a strict ordering: `Manage > Write > Read > Pull`. Each level is a superset of all lower levels.
+
+```rust
+use p2panda_auth::{Access, AccessLevel};
+
+// Construct access values for assignment to group members.
+let pull_access = Access::pull();
+let read_access = Access::read();
+let write_access = Access::write();
+let manage_access = Access::manage();
+
+// Compare access levels.
+assert!(manage_access > write_access);
+assert!(write_access > read_access);
+assert!(read_access > pull_access);
+
+// Check specific level.
+assert!(manage_access.is_manage());
+assert!(write_access.is_write());
+```
+
+| Level | Can sync | Can read | Can write | Can manage |
+|-------|----------|----------|-----------|------------|
+| `Pull` | Yes | No | No | No |
+| `Read` | Yes | Yes | No | No |
+| `Write` | Yes | Yes | Yes | No |
+| `Manage` | Yes | Yes | Yes | Yes |
+
+## Access conditions
+
+Conditions can be attached to any access level to create domain-specific access boundaries. Any type implementing `PartialOrd` can serve as a condition, allowing expiry timestamps, path hierarchies, or any application-defined rule.
+
+```rust
+use p2panda_auth::Access;
+
+// A path-based condition: access to "/public" covers all sub-paths.
+#[derive(Clone, PartialEq, Eq)]
+struct PathCondition(String);
+
+impl PartialOrd for PathCondition {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        // Implement prefix-based comparison...
+        todo!()
+    }
+}
+
+let root_access = Access::read()
+    .with_conditions(PathCondition("/public".to_string()));
+
+// A time-limited condition: access expires at timestamp 100.
+#[derive(Clone, PartialOrd, PartialEq, Eq)]
+struct ExpiresAt(u64);
+
+let timed_access = Access::write()
+    .with_conditions(ExpiresAt(100));
+```
+
+## Group operations and the DAG
+
+Group state is modified by publishing signed group operations. Each operation includes an `action` (add, remove, promote, demote), a `previous` field for causal ordering, and optional `dependencies` for application-defined relationships. All operations form a DAG.
+
+## Concurrency resolution
+
+Concurrent group modifications can produce conflicting states (for example, two managers removing each other simultaneously). The `Resolver` trait allows plugging in custom resolution logic.
+
+```rust
+use p2panda_auth::traits::Resolver;
+
+// The Resolver trait determines which operations to invalidate
+// when concurrent conflicts are detected.
+pub trait Resolver<ID, OP, M, C>
+where
+    ID: IdentityHandle,
+    OP: OperationId + Ord,
+{
+    type State;
+    type Error: Debug;
+
+    /// Returns true if a full state rebuild is needed.
+    fn rebuild_required(state: &Self::State, msg: &M) -> Result<bool, Self::Error>;
+
+    /// Process all operations and update internal state (apply invalidation filter).
+    fn process(state: Self::State) -> Result<Self::State, Self::Error>;
+}
+```
+
+### Default "strong removal" resolver
+
+The built-in resolver follows these rules:
+
+1. Removal or demotion of a manager invalidates any concurrent actions by that member.
+2. Mutual removals (two managers removing each other concurrently) are both applied, but their other concurrent actions are invalidated.
+3. Re-adds are allowed: if Alice removes Charlie and then re-adds them, Charlie is still a member but all concurrent actions are invalidated.
+4. Invalidation is transitive: invalidating an operation also invalidates all operations that depend on it.
+
+## Feature flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `processor` | off | Enables the stream processor that applies group operations in real time. |
+| `serde` | off | Derives `Serialize`/`Deserialize` for `Access`, `AccessLevel`, and related types. |
+| `test_utils` | off | Exposes test helpers and sample group states. |
+
+<CardGroup cols={2}>
+  <Card title="p2panda-encryption" href="/crates/p2panda-encryption">
+    Group encryption that integrates with auth group membership for key rotation on member changes.
+  </Card>
+  <Card title="p2panda-stream" href="/crates/p2panda-stream">
+    Stream processor interfaces used by the auth processor module.
+  </Card>
+  <Card title="p2panda-store" href="/crates/p2panda-store">
+    Stores group membership state via the `groups` sub-module.
+  </Card>
+</CardGroup>
